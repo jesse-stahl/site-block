@@ -12,3 +12,7 @@ DerivedData/
 xcuserdata/
 *.xcworkspace/xcuserdata/
 .swiftpm/
+
+# Swift Package Manager
+.build/
+Package.resolved

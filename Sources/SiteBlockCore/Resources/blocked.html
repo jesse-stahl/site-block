@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Blocked · SiteBlock</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f5f7;
+    --card-bg: #ffffff;
+    --text: #1d1d1f;
+    --subtext: #6e6e73;
+    --accent: #34785a;
+    --accent-bg: rgba(52, 120, 90, 0.1);
+    --border: rgba(0, 0, 0, 0.06);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000000;
+      --card-bg: #1c1c1e;
+      --text: #f5f5f7;
+      --subtext: #98989d;
+      --accent: #6fd9a8;
+      --accent-bg: rgba(111, 217, 168, 0.12);
+      --border: rgba(255, 255, 255, 0.08);
+    }
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  html, body {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+  }
+
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    padding: 24px;
+  }
+
+  .card {
+    width: 100%;
+    max-width: 460px;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 48px 40px;
+    text-align: center;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.06);
+  }
+
+  .icon {
+    width: 56px;
+    height: 56px;
+    margin: 0 auto 24px;
+    border-radius: 16px;
+    background: var(--accent-bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .icon svg {
+    width: 26px;
+    height: 26px;
+    stroke: var(--accent);
+    fill: none;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  h1 {
+    font-size: 22px;
+    line-height: 1.3;
+    font-weight: 600;
+    margin: 0 0 12px;
+    letter-spacing: -0.01em;
+  }
+
+  p.subline {
+    font-size: 15px;
+    line-height: 1.5;
+    color: var(--subtext);
+    margin: 0 0 28px;
+  }
+
+  .divider {
+    height: 1px;
+    background: var(--border);
+    margin: 0 0 20px;
+  }
+
+  .note {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--subtext);
+    background: var(--accent-bg);
+    padding: 8px 14px;
+    border-radius: 999px;
+  }
+
+  .note strong {
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  .footer {
+    margin-top: 28px;
+    font-size: 12px;
+    color: var(--subtext);
+    opacity: 0.7;
+  }
+</style>
+</head>
+<body>
+  <main class="card">
+    <div class="icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24">
+        <path d="M12 8v4l2.5 2.5"></path>
+        <circle cx="12" cy="12" r="9"></circle>
+      </svg>
+    </div>
+    <h1>Blocked to keep you focused.</h1>
+    <p class="subline">
+      You're in the middle of a focus session. This little pause is here
+      to help you stay on track — take a breath, and get back to what matters.
+    </p>
+    <div class="divider"></div>
+    <p class="note"><strong>This site</strong> is on your SiteBlock list</p>
+    <p class="footer">Manage your blocked sites anytime from SiteBlock.</p>
+  </main>
+</body>
+</html>

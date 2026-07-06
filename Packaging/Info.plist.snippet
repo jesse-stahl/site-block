@@ -1,0 +1,24 @@
+<!--
+  Keys to add to the SiteBlock app target's Info.plist when packaging in Xcode.
+
+  - LSUIElement makes it a menu bar app with no dock icon / no main window.
+  - The app bundle identifier must be today.siteblock.SiteBlock to match the helper's
+    AssociatedBundleIdentifiers / SMAuthorizedClients entries.
+  - The helper daemon binary is embedded at Contents/MacOS/SiteBlockHelper and its plist at
+    Contents/Library/LaunchDaemons/today.siteblock.helper.plist (see the plist template here).
+-->
+<key>LSUIElement</key>
+<true/>
+
+<key>CFBundleIdentifier</key>
+<string>today.siteblock.SiteBlock</string>
+
+<!--
+  Because the helper binds port 80 and edits /etc/hosts it runs as a privileged daemon (not a
+  sandboxed XPC service). Register it from the app with:
+
+      let service = SMAppService.daemon(plistName: "today.siteblock.helper.plist")
+      try service.register()   // triggers the one-time admin approval
+
+  The app itself enables launch-at-login via SMAppService.mainApp.register().
+-->

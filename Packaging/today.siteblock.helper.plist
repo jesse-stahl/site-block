@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd property list for the SiteBlock privileged helper.
+
+  Ships inside the app bundle at Contents/Library/LaunchDaemons/today.siteblock.helper.plist and
+  is registered via SMAppService.daemon(plistName: "today.siteblock.helper.plist"). The
+  MachServices name MUST match HelperInfo.machServiceName in SiteBlockCore.
+
+  Replace TEAMID with your Apple Developer Team ID (or the SHA of your local signing identity for
+  a personal build) so the daemon only accepts connections from the signed SiteBlock app.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>today.siteblock.helper</string>
+
+    <key>BundleProgram</key>
+    <string>Contents/MacOS/SiteBlockHelper</string>
+
+    <key>MachServices</key>
+    <dict>
+        <key>today.siteblock.helper</key>
+        <true/>
+    </dict>
+
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>today.siteblock.SiteBlock</string>
+    </array>
+
+    <!-- Only the signed SiteBlock app may talk to the helper. -->
+    <key>SMAuthorizedClients</key>
+    <array>
+        <string>identifier "today.siteblock.SiteBlock" and anchor apple generic and certificate leaf[subject.OU] = "TEAMID"</string>
+    </array>
+</dict>
+</plist>
