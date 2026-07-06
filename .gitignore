@@ -1,0 +1,14 @@
+# Local working documents (never commit)
+discussion-*.md
+plan-*.md
+
+# macOS
+.DS_Store
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcuserdata/
+.swiftpm/
