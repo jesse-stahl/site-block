@@ -11,7 +11,20 @@ private final class FakeHosts: HostsApplying, @unchecked Sendable {
 private final class FakeAuth: PasswordAuthenticating, @unchecked Sendable {
     var succeed = true
     var calls = 0
-    func authenticate(reason: String) async -> Bool { calls += 1; return succeed }
+    /// Optionally advance the clock while "the prompt is up" to simulate a slow auth.
+    var onAuthenticate: (() -> Void)?
+    func authenticate(reason: String) async -> Bool {
+        calls += 1
+        onAuthenticate?()
+        return succeed
+    }
+}
+
+/// A controllable clock for deterministic time in tests.
+private final class TestClock: @unchecked Sendable {
+    var now: Date
+    init(_ start: Date) { now = start }
+    func advance(_ seconds: TimeInterval) { now = now.addingTimeInterval(seconds) }
 }
 
 @MainActor
@@ -19,37 +32,38 @@ final class AppModelTests: XCTestCase {
 
     let t0 = Date(timeIntervalSinceReferenceDate: 2_000_000)
 
-    private func makeModel() -> (AppModel, FakeHosts, FakeAuth) {
+    private func makeModel() -> (AppModel, FakeHosts, FakeAuth, TestClock) {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("siteblock-app-\(UUID().uuidString)/blocklist.json")
         let hosts = FakeHosts()
         let auth = FakeAuth()
+        let clock = TestClock(t0)
         let model = AppModel(store: BlockListStore(url: url), hosts: hosts, auth: auth,
-                             friction: FrictionMachine(cooldown: 300, window: 120), now: t0)
-        return (model, hosts, auth)
+                             friction: FrictionMachine(cooldown: 300, window: 120),
+                             clock: { clock.now })
+        return (model, hosts, auth, clock)
     }
 
     // MARK: strengthen — instant
 
     func testAddDomainIsInstantAndAppliesWhenBlocking() async {
-        let (model, hosts, _) = makeModel()
+        let (model, hosts, _, _) = makeModel()
         await model.turnBlockingOn()
         await model.addDomain("facebook.com")
         XCTAssertEqual(model.domains, ["facebook.com"])
-        // Applied to system without any friction/pending.
         XCTAssertNil(model.pending)
         XCTAssertTrue(hosts.applied.last?.contains("facebook.com") ?? false)
     }
 
     func testAddInvalidDomainSetsStatusAndDoesNotAdd() async {
-        let (model, _, _) = makeModel()
+        let (model, _, _, _) = makeModel()
         await model.addDomain("not a domain")
         XCTAssertTrue(model.domains.isEmpty)
         XCTAssertNotNil(model.status)
     }
 
     func testTurnOnIsInstant() async {
-        let (model, hosts, _) = makeModel()
+        let (model, hosts, _, _) = makeModel()
         await model.turnBlockingOn()
         XCTAssertTrue(model.isBlocking)
         XCTAssertNil(model.pending)
@@ -59,7 +73,7 @@ final class AppModelTests: XCTestCase {
     // MARK: weaken — gated
 
     func testTurnOffRequiresCooldownThenWindowThenAuth() async {
-        let (model, hosts, auth) = makeModel()
+        let (model, hosts, auth, clock) = makeModel()
         await model.turnBlockingOn()
         await model.addDomain("facebook.com")
 
@@ -67,7 +81,8 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.pending, .turnOff)
 
         // Too early — inside cooldown, cannot confirm.
-        model.tick(now: t0.addingTimeInterval(120))
+        clock.advance(120)
+        model.tick()
         XCTAssertFalse(model.canConfirm)
         let early = await model.confirmPending()
         XCTAssertFalse(early)
@@ -75,7 +90,8 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(auth.calls, 0, "no password prompt during cooldown")
 
         // Window open — confirm with successful auth.
-        model.tick(now: t0.addingTimeInterval(330))
+        clock.now = t0.addingTimeInterval(330)
+        model.tick()
         XCTAssertTrue(model.canConfirm)
         let ok = await model.confirmPending()
         XCTAssertTrue(ok)
@@ -86,48 +102,69 @@ final class AppModelTests: XCTestCase {
     }
 
     func testTurnOffFailsIfAuthCancelled() async {
-        let (model, _, auth) = makeModel()
+        let (model, _, auth, clock) = makeModel()
         auth.succeed = false
         await model.turnBlockingOn()
 
         model.requestTurnOff()
-        model.tick(now: t0.addingTimeInterval(330))
+        clock.now = t0.addingTimeInterval(330)
+        model.tick()
         let ok = await model.confirmPending()
         XCTAssertFalse(ok)
         XCTAssertTrue(model.isBlocking, "auth cancelled → still blocking")
     }
 
-    func testExpiredWindowClearsPending() async {
-        let (model, _, _) = makeModel()
+    func testSlowAuthThatOutlastsWindowIsRejected() async {
+        // Copilot finding: the window must be re-checked AFTER auth returns. Simulate an auth
+        // prompt that succeeds but only after the 2-minute window has closed.
+        let (model, hosts, auth, clock) = makeModel()
         await model.turnBlockingOn()
         model.requestTurnOff()
-        model.tick(now: t0.addingTimeInterval(500)) // past 300+120
+        clock.now = t0.addingTimeInterval(330) // window open
+        model.tick()
+        XCTAssertTrue(model.canConfirm)
+        // While the prompt is up, real time advances past the window end (300+120 = 420).
+        auth.onAuthenticate = { clock.now = self.t0.addingTimeInterval(500) }
+
+        let ok = await model.confirmPending()
+        XCTAssertFalse(ok, "expired-during-auth window must not confirm")
+        XCTAssertTrue(model.isBlocking, "still blocking")
+        XCTAssertNil(model.pending)
+    }
+
+    func testExpiredWindowClearsPending() async {
+        let (model, _, _, clock) = makeModel()
+        await model.turnBlockingOn()
+        model.requestTurnOff()
+        clock.now = t0.addingTimeInterval(500) // past 300+120
+        model.tick()
         XCTAssertNil(model.pending)
         XCTAssertTrue(model.isBlocking)
     }
 
     func testRemoveDomainIsGated() async {
-        let (model, hosts, _) = makeModel()
+        let (model, hosts, _, clock) = makeModel()
         await model.turnBlockingOn()
         await model.addDomain("facebook.com")
         await model.addDomain("x.com")
 
         model.requestRemove("facebook.com")
         XCTAssertEqual(model.pending, .removeDomain("facebook.com"))
-        model.tick(now: t0.addingTimeInterval(330))
+        clock.now = t0.addingTimeInterval(330)
+        model.tick()
         let ok = await model.confirmPending()
         XCTAssertTrue(ok)
         XCTAssertEqual(model.domains, ["x.com"])
-        // System re-applied with the remaining domain only.
         XCTAssertTrue(hosts.applied.last?.contains("x.com") ?? false)
         XCTAssertFalse(hosts.applied.last?.contains("facebook.com") ?? true)
     }
 
     func testCancelPendingResetsTimer() async {
-        let (model, _, _) = makeModel()
+        let (model, _, _, clock) = makeModel()
         await model.turnBlockingOn()
         model.requestTurnOff()
-        model.tick(now: t0.addingTimeInterval(100))
+        clock.advance(100)
+        model.tick()
         model.cancelPending()
         XCTAssertNil(model.pending)
         XCTAssertNil(model.cooldownRemaining)
@@ -136,11 +173,12 @@ final class AppModelTests: XCTestCase {
     // MARK: lifecycle
 
     func testReconcileOnLaunchResetsTimerAndAppliesBlocking() async {
-        let (model, hosts, _) = makeModel()
+        let (model, hosts, _, clock) = makeModel()
         await model.turnBlockingOn()
         await model.addDomain("facebook.com")
         model.requestTurnOff()
-        model.tick(now: t0.addingTimeInterval(310)) // armed
+        clock.now = t0.addingTimeInterval(310) // armed
+        model.tick()
 
         await model.reconcileOnLaunch()
         XCTAssertNil(model.pending, "pending timer never survives a relaunch")

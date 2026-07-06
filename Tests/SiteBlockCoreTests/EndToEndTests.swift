@@ -31,12 +31,13 @@ final class EndToEndTests: XCTestCase {
         try Data(preamble.utf8).write(to: hostsPath)
 
         let t0 = Date(timeIntervalSinceReferenceDate: 3_000_000)
+        var clockNow = t0
         let model = AppModel(
             store: BlockListStore(url: dir.appendingPathComponent("blocklist.json")),
             hosts: DiskHosts(path: hostsPath),
             auth: OKAuth(),
             friction: FrictionMachine(cooldown: 300, window: 120),
-            now: t0
+            clock: { clockNow }
         )
 
         // 1. Strengthen: turn on + add a domain (instant). The real hosts file gets the region.
@@ -52,14 +53,16 @@ final class EndToEndTests: XCTestCase {
 
         // 2. Weaken is gated: request turn-off, cannot confirm during the 5-min cooldown.
         model.requestTurnOff()
-        model.tick(now: t0.addingTimeInterval(299))
+        clockNow = t0.addingTimeInterval(299)
+        model.tick()
         let early = await model.confirmPending()
         XCTAssertFalse(early, "cannot unblock during cooldown")
         XCTAssertTrue(try String(contentsOf: hostsPath, encoding: .utf8).contains("facebook.com"),
                       "still blocked on disk during cooldown")
 
         // 3. After the cooldown, within the 2-min window, confirm succeeds → region removed.
-        model.tick(now: t0.addingTimeInterval(330))
+        clockNow = t0.addingTimeInterval(330)
+        model.tick()
         XCTAssertTrue(model.canConfirm)
         let ok = await model.confirmPending()
         XCTAssertTrue(ok, "confirm succeeds within the window")

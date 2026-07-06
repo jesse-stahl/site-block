@@ -27,7 +27,7 @@ struct MenuBarView: View {
         .frame(width: 320)
         // Drive the friction countdown only while something is pending.
         .onReceive(tick) { _ in
-            if model.pending != nil { model.tick(now: Date()) }
+            if model.pending != nil { model.tick() }
         }
     }
 
@@ -52,7 +52,7 @@ struct MenuBarView: View {
                 pendingControls(label: "Turning blocking off")
             } else {
                 Button(role: .destructive) {
-                    model.tick(now: Date())
+                    model.tick()
                     model.requestTurnOff()
                 } label: {
                     Label("Turn off blocking…", systemImage: "hourglass")
@@ -114,7 +114,7 @@ struct MenuBarView: View {
                 Text(domain).font(.body.monospaced())
                 Spacer()
                 Button {
-                    model.tick(now: Date())
+                    model.tick()
                     model.requestRemove(domain)
                 } label: {
                     Image(systemName: "trash")

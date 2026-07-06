@@ -27,6 +27,9 @@ public final class BlockedPageServer {
     public func start(port requestedPort: UInt16 = 0) throws {
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
+        // Bind loopback only. Blocked domains resolve to 127.0.0.1, so only local redirected
+        // traffic should ever reach this server — never the LAN (the helper runs as root on :80).
+        params.requiredInterfaceType = .loopback
         let nwPort = NWEndpoint.Port(rawValue: requestedPort) ?? .any
         let listener = try NWListener(using: params, on: nwPort)
         self.listener = listener

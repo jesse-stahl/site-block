@@ -50,7 +50,7 @@ This is the one-time gate that makes everything afterward password-free.
 2. Toggle blocking **ON**.
 3. Confirm both actions complete instantly with **no password prompt and no delay**.
 4. Check `/etc/hosts` in a terminal and confirm `example.com` (and its usual variants)
-   now resolve to `0.0.0.0` / `::1` inside the SiteBlock managed region (see §8 for the
+   now resolve to `127.0.0.1` / `::1` inside the SiteBlock managed region (see §8 for the
    marker format).
 
 ## 4. Verify real blocking across browsers

@@ -53,7 +53,6 @@ public enum HostsFile {
         guard let range = regionLineRange(in: content) else { return content }
         var lines = splitLines(content)
         lines.removeSubrange(range)
-        // Collapse a leading empty line left behind by removal at the very top.
         return lines.joined(separator: "\n")
     }
 
@@ -131,7 +130,17 @@ public struct HostsFileWriter {
 
     private func writeAtomically(_ content: String) throws {
         // Data.write(.atomic) writes to a temp file in the same volume and renames into place,
-        // so a crash mid-write can never leave a corrupted hosts file.
+        // so a crash mid-write can never leave a corrupted hosts file. The rename creates a new
+        // inode, so we capture the existing POSIX permissions first and restore them afterwards —
+        // otherwise /etc/hosts could end up with the wrong mode (it should stay 0644 root:wheel).
+        let existingPermissions = try? FileManager.default
+            .attributesOfItem(atPath: path.path)[.posixPermissions] as? NSNumber
+
         try Data(content.utf8).write(to: path, options: .atomic)
+
+        if let permissions = existingPermissions {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: permissions], ofItemAtPath: path.path)
+        }
     }
 }
