@@ -19,6 +19,20 @@ public protocol PasswordAuthenticating {
     func authenticate(reason: String) async -> Bool
 }
 
+/// Fetches the block-attempt tallies (via the privileged helper in production, a fake in tests).
+public protocol BlockStatsProviding {
+    func fetchBlockStats() async throws -> BlockStats
+}
+
+/// Tells the user a blocked site was just hit (a notification banner in production, a fake in
+/// tests).
+public protocol BlockNotifying {
+    /// - Parameters:
+    ///   - domain: the block-list domain that was attempted (e.g. "facebook.com").
+    ///   - count: the all-time number of blocked attempts for that domain.
+    func notifyBlocked(domain: String, count: Int) async
+}
+
 /// The observable app state and all of SiteBlock's action logic, independent of SwiftUI so it can
 /// be unit-tested. Enforces the asymmetric friction model:
 ///
@@ -58,23 +72,38 @@ public final class AppModel: ObservableObject {
     /// Whether the last enforcement attempt was verified to have landed in the system. This is the
     /// *truth* about blocking, as opposed to `blockList.isBlocking`, which is only the user's intent.
     @Published public private(set) var systemBlockVerified: Bool = false
+    /// The latest block-attempt tallies fetched from the helper (empty until the first refresh).
+    @Published public private(set) var blockStats = BlockStats()
     /// The last observed time, refreshed on every `tick()` — used by the display helpers.
     @Published public private(set) var now: Date
 
     private let store: BlockListStore
     private let hosts: HostsApplying
     private let auth: PasswordAuthenticating
+    private let statsProvider: BlockStatsProviding?
+    private let notifier: BlockNotifying?
     private let clock: () -> Date
+    /// Per-domain time of the last posted notification, for rate-limiting.
+    private var lastNotified: [String: Date] = [:]
+    /// Minimum gap between notifications for the same domain — a blocked page reload spree
+    /// shouldn't buzz the user every few seconds.
+    private let notificationInterval: TimeInterval
 
     public init(store: BlockListStore,
                 hosts: HostsApplying,
                 auth: PasswordAuthenticating,
+                statsProvider: BlockStatsProviding? = nil,
+                notifier: BlockNotifying? = nil,
                 friction: FrictionMachine = FrictionMachine(),
+                notificationInterval: TimeInterval = 60,
                 clock: @escaping () -> Date = { Date() }) {
         self.store = store
         self.hosts = hosts
         self.auth = auth
+        self.statsProvider = statsProvider
+        self.notifier = notifier
         self.friction = friction
+        self.notificationInterval = notificationInterval
         self.clock = clock
         self.now = clock()
         self.blockList = (try? store.load()) ?? BlockList()
@@ -209,6 +238,51 @@ public final class AppModel: ObservableObject {
         self.pending = nil
         status = nil
         return true
+    }
+
+    // MARK: - Block statistics
+
+    /// Whether we've fetched stats at least once. The first fetch only baselines: counts accrued
+    /// while the app wasn't watching (or before this launch) must not fire a notification storm.
+    private var statsBaselined = false
+
+    /// All-time blocked attempts for a block-list domain, aggregated across its covered hosts
+    /// (facebook.com + www.facebook.com + m.facebook.com + …).
+    public func blockedCount(for domain: String) -> Int {
+        Self.aggregate(blockStats, for: domain)
+    }
+
+    /// Fetch the latest tallies from the helper, publish them, and notify the user about domains
+    /// whose counts grew since the last refresh (rate-limited per domain). Called on a timer by
+    /// the app and directly by tests.
+    public func refreshStats() async {
+        guard let statsProvider else { return }
+        guard let fresh = try? await statsProvider.fetchBlockStats() else { return }
+
+        let previous = blockStats
+        blockStats = fresh
+        guard statsBaselined else {
+            statsBaselined = true
+            return
+        }
+        guard let notifier else { return }
+
+        for domain in blockList.domains {
+            let newCount = Self.aggregate(fresh, for: domain)
+            guard newCount > Self.aggregate(previous, for: domain) else { continue }
+            let currentTime = clock()
+            if let last = lastNotified[domain], currentTime.timeIntervalSince(last) < notificationInterval {
+                continue
+            }
+            lastNotified[domain] = currentTime
+            await notifier.notifyBlocked(domain: domain, count: newCount)
+        }
+    }
+
+    private static func aggregate(_ stats: BlockStats, for domain: String) -> Int {
+        stats.counts.reduce(0) { sum, entry in
+            entry.key == domain || entry.key.hasSuffix("." + domain) ? sum + entry.value : sum
+        }
     }
 
     // MARK: - Lifecycle

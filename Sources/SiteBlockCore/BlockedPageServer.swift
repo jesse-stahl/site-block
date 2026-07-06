@@ -13,6 +13,11 @@ public final class BlockedPageServer {
     private let queue = DispatchQueue(label: "today.siteblock.blockedpage")
     private var listener: NWListener?
 
+    /// Called with the request's `Host` header value (lowercased, port stripped) whenever a
+    /// redirected request is served — this is how block attempts get counted. Invoked on the
+    /// server's queue.
+    public var onHit: ((String) -> Void)?
+
     /// The port the listener is bound to once started (nil before `start`).
     public private(set) var port: UInt16?
 
@@ -75,10 +80,32 @@ public final class BlockedPageServer {
 
     private func handle(_ connection: NWConnection) {
         connection.start(queue: queue)
-        // Read the request (we don't parse it — any request gets the blocked page), then reply.
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] _, _, _, _ in
+        // Read the request — any request gets the blocked page, but the Host header tells us
+        // WHICH blocked site was attempted, which feeds the block counter.
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, _, _ in
+            if let data, let host = Self.hostHeader(in: data) {
+                self?.onHit?(host)
+            }
             self?.respond(on: connection)
         }
+    }
+
+    /// Extract the `Host` header value from a raw HTTP request: lowercased, `:port` stripped.
+    /// Nil if the bytes aren't parseable as headers or carry no Host.
+    static func hostHeader(in data: Data) -> String? {
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        for line in text.components(separatedBy: "\r\n").dropFirst() {
+            if line.isEmpty { break } // end of headers
+            let parts = line.split(separator: ":", maxSplits: 1)
+            guard parts.count == 2, parts[0].trimmingCharacters(in: .whitespaces).lowercased() == "host"
+            else { continue }
+            var host = parts[1].trimmingCharacters(in: .whitespaces).lowercased()
+            if let portIndex = host.lastIndex(of: ":"), host[host.index(after: portIndex)...].allSatisfy(\.isNumber) {
+                host = String(host[..<portIndex])
+            }
+            return host.isEmpty ? nil : host
+        }
+        return nil
     }
 
     private func respond(on connection: NWConnection) {

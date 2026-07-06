@@ -1,11 +1,12 @@
 import Foundation
 import ServiceManagement
 import LocalAuthentication
+import UserNotifications
 import SiteBlockCore
 
 /// Talks to the privileged helper over XPC to apply/remove the system block. Conforms to
 /// `HostsApplying` so `AppModel` is agnostic about how blocking reaches `/etc/hosts`.
-final class HelperClient: HostsApplying, @unchecked Sendable {
+final class HelperClient: HostsApplying, BlockStatsProviding, @unchecked Sendable {
 
     enum HelperClientError: LocalizedError {
         case failed(String)
@@ -54,6 +55,28 @@ final class HelperClient: HostsApplying, @unchecked Sendable {
             }
             control.currentManagedHosts { hosts in
                 if resumed.claim() { continuation.resume(returning: hosts) }
+            }
+        }
+    }
+
+    /// Fetch the block-attempt tallies from the helper (JSON blob over XPC).
+    func fetchBlockStats() async throws -> BlockStats {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<BlockStats, Error>) in
+            let resumed = ResumeGuard()
+            let proxy = connection.remoteObjectProxyWithErrorHandler { error in
+                if resumed.claim() { continuation.resume(throwing: error) }
+            }
+            guard let control = proxy as? HostsControlProtocol else {
+                if resumed.claim() { continuation.resume(throwing: HelperClientError.failed("Helper unavailable")) }
+                return
+            }
+            control.blockStats { data in
+                guard resumed.claim() else { return }
+                guard let data, let stats = try? JSONDecoder().decode(BlockStats.self, from: data) else {
+                    continuation.resume(throwing: HelperClientError.failed("Stats unavailable"))
+                    return
+                }
+                continuation.resume(returning: stats)
             }
         }
     }
@@ -111,6 +134,35 @@ final class PasswordAuth: PasswordAuthenticating {
                 continuation.resume(returning: success)
             }
         }
+    }
+}
+
+/// Posts a macOS notification banner when a blocked site is hit — the "popup from the menu bar"
+/// feedback that blocking is doing its job.
+final class BlockNotificationBanner: BlockNotifying, @unchecked Sendable {
+
+    private var authorizationRequested = false
+
+    func notifyBlocked(domain: String, count: Int) async {
+        // UNUserNotificationCenter traps when there's no app bundle (e.g. running the bare SPM
+        // executable); notifications are a nicety, never worth crashing over.
+        guard Bundle.main.bundleIdentifier != nil else { return }
+        let center = UNUserNotificationCenter.current()
+
+        if !authorizationRequested {
+            authorizationRequested = true
+            _ = try? await center.requestAuthorization(options: [.alert, .sound])
+        }
+
+        let content = UNMutableNotificationContent()
+        content.title = "SiteBlock kept you focused"
+        content.body = count == 1
+            ? "Blocked your first visit to \(domain)."
+            : "Blocked \(domain) — \(count) times so far."
+        content.sound = nil // visible but not noisy
+        let request = UNNotificationRequest(identifier: "siteblock.hit.\(domain)",
+                                            content: content, trigger: nil)
+        try? await center.add(request)
     }
 }
 

@@ -26,6 +26,18 @@ private final class FakeHosts: HostsApplying, @unchecked Sendable {
 
 private struct FakeHostsError: Error {}
 
+private final class FakeStatsProvider: BlockStatsProviding, @unchecked Sendable {
+    var stats = BlockStats()
+    func fetchBlockStats() async throws -> BlockStats { stats }
+}
+
+private final class FakeNotifier: BlockNotifying, @unchecked Sendable {
+    var notifications: [(domain: String, count: Int)] = []
+    func notifyBlocked(domain: String, count: Int) async {
+        notifications.append((domain, count))
+    }
+}
+
 private final class FakeAuth: PasswordAuthenticating, @unchecked Sendable {
     var succeed = true
     var calls = 0
@@ -296,6 +308,90 @@ final class AppModelTests: XCTestCase {
         _ = await model.confirmPending()
         XCTAssertEqual(model.blockingStatus, .off)
         XCTAssertFalse(model.systemBlockVerified)
+    }
+
+    // MARK: block statistics + notifications
+
+    private func makeStatsModel() -> (AppModel, FakeStatsProvider, FakeNotifier, TestClock) {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("siteblock-stats-\(UUID().uuidString)/blocklist.json")
+        let provider = FakeStatsProvider()
+        let notifier = FakeNotifier()
+        let clock = TestClock(t0)
+        let model = AppModel(store: BlockListStore(url: url), hosts: FakeHosts(), auth: FakeAuth(),
+                             statsProvider: provider, notifier: notifier,
+                             friction: FrictionMachine(cooldown: 300, window: 120),
+                             notificationInterval: 60,
+                             clock: { clock.now })
+        return (model, provider, notifier, clock)
+    }
+
+    func testBlockedCountAggregatesSubdomains() async {
+        let (model, provider, _, _) = makeStatsModel()
+        await model.addDomain("facebook.com")
+        provider.stats = BlockStats(counts: [
+            "facebook.com": 2, "www.facebook.com": 3, "m.facebook.com": 1, "x.com": 7,
+        ])
+        await model.refreshStats()
+        XCTAssertEqual(model.blockedCount(for: "facebook.com"), 6, "domain + its subdomains")
+        XCTAssertEqual(model.blockStats.total, 13, "raw total is unfiltered")
+    }
+
+    func testFirstRefreshBaselinesWithoutNotifying() async {
+        // Counts accrued before this launch must not fire a notification storm on startup.
+        let (model, provider, notifier, _) = makeStatsModel()
+        await model.addDomain("facebook.com")
+        provider.stats = BlockStats(counts: ["facebook.com": 42])
+        await model.refreshStats()
+        XCTAssertTrue(notifier.notifications.isEmpty, "baseline fetch is silent")
+        XCTAssertEqual(model.blockedCount(for: "facebook.com"), 42, "but counts still display")
+    }
+
+    func testIncreaseAfterBaselineNotifiesWithAggregatedCount() async {
+        let (model, provider, notifier, _) = makeStatsModel()
+        await model.addDomain("facebook.com")
+        provider.stats = BlockStats(counts: ["facebook.com": 1])
+        await model.refreshStats() // baseline
+
+        provider.stats = BlockStats(counts: ["facebook.com": 1, "www.facebook.com": 2])
+        await model.refreshStats()
+        XCTAssertEqual(notifier.notifications.count, 1)
+        XCTAssertEqual(notifier.notifications.first?.domain, "facebook.com")
+        XCTAssertEqual(notifier.notifications.first?.count, 3, "aggregated across subdomains")
+    }
+
+    func testNotificationsAreRateLimitedPerDomain() async {
+        let (model, provider, notifier, clock) = makeStatsModel()
+        await model.addDomain("facebook.com")
+        provider.stats = BlockStats(counts: ["facebook.com": 1])
+        await model.refreshStats() // baseline
+
+        provider.stats = BlockStats(counts: ["facebook.com": 2])
+        await model.refreshStats() // notifies
+        provider.stats = BlockStats(counts: ["facebook.com": 3])
+        await model.refreshStats() // within 60s — suppressed
+        XCTAssertEqual(notifier.notifications.count, 1, "second increase inside the interval is quiet")
+
+        clock.advance(61)
+        provider.stats = BlockStats(counts: ["facebook.com": 4])
+        await model.refreshStats() // interval elapsed — notifies again
+        XCTAssertEqual(notifier.notifications.count, 2)
+        XCTAssertEqual(notifier.notifications.last?.count, 4)
+    }
+
+    func testUnchangedCountsStayQuiet() async {
+        let (model, provider, notifier, _) = makeStatsModel()
+        await model.addDomain("facebook.com")
+        provider.stats = BlockStats(counts: ["facebook.com": 5])
+        await model.refreshStats() // baseline
+        await model.refreshStats() // same counts
+        XCTAssertTrue(notifier.notifications.isEmpty)
+    }
+
+    func testRefreshWithoutProviderIsANoOp() async {
+        let (model, _, _, _) = makeModel() // no statsProvider
+        await model.refreshStats()
+        XCTAssertEqual(model.blockStats.total, 0)
     }
 
     // MARK: lifecycle

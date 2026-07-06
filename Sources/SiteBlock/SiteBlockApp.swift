@@ -18,7 +18,9 @@ struct SiteBlockApp: App {
         let model = AppModel(
             store: BlockListStore(url: BlockListStore.defaultURL()),
             hosts: helper,
-            auth: PasswordAuth()
+            auth: PasswordAuth(),
+            statsProvider: helper,
+            notifier: BlockNotificationBanner()
         )
         _model = StateObject(wrappedValue: model)
 
@@ -27,6 +29,14 @@ struct SiteBlockApp: App {
             try? helper.registerHelperIfNeeded()
             LaunchAtLogin.setEnabled(true)
             await model.reconcileOnLaunch()
+
+            // Poll the helper's block tallies so the menu shows live counts and a banner fires
+            // when a blocked site is hit. 5s keeps the notification timely without meaningful
+            // cost (a tiny local XPC round-trip).
+            while !Task.isCancelled {
+                await model.refreshStats()
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+            }
         }
     }
 

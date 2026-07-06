@@ -39,6 +39,35 @@ final class BlockedPageServerTests: XCTestCase {
         XCTAssertTrue(body.lowercased().contains("<"), "served some HTML")
     }
 
+    // MARK: hit reporting
+
+    func testReportsHostHeaderOnHit() throws {
+        let server = BlockedPageServer(html: "<html>x</html>")
+        try server.start()
+        defer { server.stop() }
+        let port = try XCTUnwrap(server.port)
+
+        let hit = expectation(description: "onHit fired")
+        server.onHit = { host in
+            // URLSession sends "Host: 127.0.0.1:PORT"; the port must be stripped.
+            XCTAssertEqual(host, "127.0.0.1")
+            hit.fulfill()
+        }
+        _ = try fetch(URL(string: "http://127.0.0.1:\(port)/")!)
+        wait(for: [hit], timeout: 5)
+    }
+
+    func testHostHeaderParsing() {
+        func req(_ hostLine: String) -> Data {
+            Data("GET / HTTP/1.1\r\n\(hostLine)\r\nAccept: */*\r\n\r\n".utf8)
+        }
+        XCTAssertEqual(BlockedPageServer.hostHeader(in: req("Host: facebook.com")), "facebook.com")
+        XCTAssertEqual(BlockedPageServer.hostHeader(in: req("host: FACEBOOK.com")), "facebook.com", "case-insensitive, lowercased")
+        XCTAssertEqual(BlockedPageServer.hostHeader(in: req("Host: facebook.com:80")), "facebook.com", "port stripped")
+        XCTAssertNil(BlockedPageServer.hostHeader(in: req("X-Other: nope")), "no Host header")
+        XCTAssertNil(BlockedPageServer.hostHeader(in: Data([0xFF, 0xFE, 0x00])), "not UTF-8")
+    }
+
     // MARK: helper
 
     private func fetch(_ url: URL) throws -> (Int, String) {

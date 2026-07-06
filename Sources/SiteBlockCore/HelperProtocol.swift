@@ -23,4 +23,8 @@ public enum HelperInfo {
 
     /// The hosts currently present in the managed region (for reconciliation on launch).
     func currentManagedHosts(withReply reply: @escaping (_ hosts: [String]) -> Void)
+
+    /// The running block-attempt tallies as JSON-encoded `BlockStats` (a Data blob keeps the XPC
+    /// surface to plist-safe types). Nil if encoding fails.
+    func blockStats(withReply reply: @escaping (_ statsJSON: Data?) -> Void)
 }

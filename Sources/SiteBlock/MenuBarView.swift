@@ -168,6 +168,12 @@ struct MenuBarView: View {
             HStack {
                 Text(domain).font(.body.monospaced())
                 Spacer()
+                if model.blockedCount(for: domain) > 0 {
+                    Text("\(model.blockedCount(for: domain))×")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .help("Blocked attempts")
+                }
                 Button {
                     model.tick()
                     model.requestRemove(domain)
@@ -210,7 +216,9 @@ struct MenuBarView: View {
 
     private var footer: some View {
         HStack {
-            Text("Blocks across all browsers.")
+            Text(model.blockStats.total > 0
+                 ? "\(model.blockStats.total) attempts blocked so far."
+                 : "Blocks across all browsers.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             Spacer()
