@@ -21,9 +21,15 @@ public final class BlockedPageServer {
     /// The port the listener is bound to once started (nil before `start`).
     public private(set) var port: UInt16?
 
+    /// How long an accepted connection may sit without delivering bytes before being closed.
+    /// Without this, a peer that connects and sends nothing would hold a root-helper file
+    /// descriptor forever (the receive completion never fires for a silent socket).
+    private let idleTimeout: TimeInterval
+
     /// - Parameter html: the page body to serve. Defaults to the bundled `blocked.html`.
-    public init(html: String = SiteBlockResources.blockedPageHTML) {
+    public init(html: String = SiteBlockResources.blockedPageHTML, idleTimeout: TimeInterval = 10) {
         self.html = html
+        self.idleTimeout = idleTimeout
     }
 
     /// Start listening. Blocks until the listener is ready (or throws on failure/timeout).
@@ -87,6 +93,12 @@ public final class BlockedPageServer {
                 self?.onHit?(host)
             }
             self?.respond(on: connection)
+        }
+        // Idle deadline: a peer that never sends leaves the receive completion unfired, so
+        // enforce an upper bound on the connection's lifetime. cancel() after completion is a
+        // safe no-op; the weak capture lets an already-closed connection deallocate.
+        queue.asyncAfter(deadline: .now() + idleTimeout) { [weak connection] in
+            connection?.cancel()
         }
     }
 

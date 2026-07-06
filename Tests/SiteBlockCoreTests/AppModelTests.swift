@@ -310,6 +310,66 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(model.systemBlockVerified)
     }
 
+    // MARK: runtime enforcement re-verification
+
+    func testVerifyEnforcementSelfHealsWhenRegionStripped() async {
+        let (model, hosts, _, _) = makeModel()
+        await model.turnBlockingOn()
+        await model.addDomain("facebook.com")
+        XCTAssertEqual(model.blockingStatus, .active)
+
+        // The block gets stripped behind our back (outside edit / another tool).
+        hosts.live = []
+        let appliesBefore = hosts.applied.count
+        await model.verifyEnforcement()
+        XCTAssertEqual(hosts.applied.count, appliesBefore + 1, "drift triggers an ungated re-push")
+        XCTAssertEqual(model.blockingStatus, .active, "healed and re-verified")
+    }
+
+    func testVerifyEnforcementReportsNotEnforcedWhenHealFails() async {
+        let (model, hosts, _, _) = makeModel()
+        await model.turnBlockingOn()
+        await model.addDomain("facebook.com")
+        XCTAssertEqual(model.blockingStatus, .active)
+
+        // Region stripped AND the helper has become unreachable — healing must fail loudly.
+        hosts.live = []
+        hosts.applyError = FakeHostsError()
+        await model.verifyEnforcement()
+        XCTAssertEqual(model.blockingStatus, .notEnforced)
+        XCTAssertNotNil(model.status)
+    }
+
+    func testVerifyEnforcementIsQuietWhenAllGood() async {
+        let (model, hosts, _, _) = makeModel()
+        await model.turnBlockingOn()
+        await model.addDomain("facebook.com")
+        let appliesBefore = hosts.applied.count
+        await model.verifyEnforcement()
+        XCTAssertEqual(hosts.applied.count, appliesBefore, "no drift → no re-push")
+        XCTAssertEqual(model.blockingStatus, .active)
+    }
+
+    func testVerifyEnforcementNoOpWhenBlockingOff() async {
+        let (model, hosts, _, _) = makeModel()
+        await model.verifyEnforcement()
+        XCTAssertTrue(hosts.applied.isEmpty)
+        XCTAssertEqual(model.blockingStatus, .off)
+    }
+
+    func testVerifyEnforcementDoesNotDisturbPendingWeaken() async {
+        let (model, hosts, _, clock) = makeModel()
+        await model.turnBlockingOn()
+        model.requestTurnOff()
+        clock.advance(60)
+        model.tick()
+        hosts.live = [] // drift while a weaken is pending
+        await model.verifyEnforcement()
+        XCTAssertEqual(model.pending, .turnOff, "healing must not clear the in-flight weaken")
+        XCTAssertNotNil(model.cooldownRemaining)
+        XCTAssertEqual(model.blockingStatus, .active, "and still heals")
+    }
+
     // MARK: block statistics + notifications
 
     private func makeStatsModel() -> (AppModel, FakeStatsProvider, FakeNotifier, TestClock) {

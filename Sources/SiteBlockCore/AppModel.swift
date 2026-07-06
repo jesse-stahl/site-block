@@ -128,6 +128,25 @@ public final class AppModel: ObservableObject {
         else { await removeFromSystem() }
     }
 
+    /// Re-check that the system still enforces the current intent, and self-heal if it doesn't.
+    /// Called periodically: a verified-at-write block can be stripped later (a macOS update
+    /// rewriting /etc/hosts, another hosts-managing tool, a manual sudo edit) and the UI must not
+    /// keep claiming `.active`. Re-applying is a *strengthen* action, so healing is ungated —
+    /// only weakening goes through the friction gate. No-op while blocking is off.
+    public func verifyEnforcement() async {
+        guard blockList.isBlocking else { return }
+        let expected = blockList.allBlockedHosts()
+        // Unreachable helper → we can no longer vouch for enforcement; pushToSystem below will
+        // set the precise status message.
+        let live = (try? await hosts.currentManagedHosts()) ?? []
+        if Set(expected).isSubset(of: Set(live)) {
+            systemBlockVerified = true
+            return
+        }
+        systemBlockVerified = false
+        await pushToSystem()
+    }
+
     // MARK: - Strengthen actions (instant, ungated)
 
     /// Add a domain. Instant. Applies to the live system if blocking is on. No-op for invalid or

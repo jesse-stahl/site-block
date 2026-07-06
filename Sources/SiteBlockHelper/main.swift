@@ -33,7 +33,9 @@ final class HostsControlService: NSObject, HostsControlProtocol {
     }
 
     /// Count an observed access attempt — but only for hosts we are actually blocking right now,
-    /// so stray loopback traffic (local dev servers, etc.) can never inflate the tallies.
+    /// so stray loopback traffic (local dev servers, etc.) never lands in the tallies. Note the
+    /// guarantee's limit: loopback carries no peer identity, so a local process CAN craft hits
+    /// for a currently-blocked domain. Counts are motivational display, never a security input.
     private func recordAttempt(_ host: String) {
         guard let managed = try? writer.currentManagedHosts(), managed.contains(host) else { return }
         // Persist only when a new event was counted (coalescing absorbs the connection storms

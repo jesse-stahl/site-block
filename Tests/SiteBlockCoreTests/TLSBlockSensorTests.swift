@@ -46,6 +46,30 @@ final class TLSBlockSensorTests: XCTestCase {
         XCTAssertNil(sensor.port)
     }
 
+    func testSilentConnectionIsClosedByIdleTimeout() throws {
+        // A peer that connects but never sends must not hold a helper fd forever.
+        let sensor = TLSBlockSensor(idleTimeout: 0.3)
+        try sensor.start()
+        defer { sensor.stop() }
+        let port = try XCTUnwrap(sensor.port)
+
+        let closed = expectation(description: "server closed the idle connection")
+        let connection = NWConnection(
+            host: .ipv4(.loopback),
+            port: NWEndpoint.Port(rawValue: port)!,
+            using: .tcp
+        )
+        // Observe EOF/reset from the server closing on us. The receive completion fires exactly
+        // once, making it the single safe fulfill site (a state handler would double-fulfill).
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1) { _, _, isComplete, error in
+            if isComplete || error != nil { closed.fulfill() }
+        }
+        connection.start(queue: .global())
+        defer { connection.cancel() }
+
+        wait(for: [closed], timeout: 5)
+    }
+
     // MARK: helper
 
     /// Open a raw TCP connection to the loopback sensor and write `data`.

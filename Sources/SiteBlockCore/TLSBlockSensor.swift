@@ -17,11 +17,17 @@ public final class TLSBlockSensor {
 
     private let queue = DispatchQueue(label: "today.siteblock.tlssensor")
     private var listener: NWListener?
+    /// How long an accepted connection may sit without delivering bytes before being closed.
+    /// Without this, a peer that connects and sends nothing would hold a root-helper file
+    /// descriptor forever (the receive completion never fires for a silent socket).
+    private let idleTimeout: TimeInterval
 
     /// The port the listener is bound to once started (nil before `start`).
     public private(set) var port: UInt16?
 
-    public init() {}
+    public init(idleTimeout: TimeInterval = 10) {
+        self.idleTimeout = idleTimeout
+    }
 
     /// Start listening. Blocks until the listener is ready (or throws on failure/timeout).
     /// - Parameter port: the TCP port to bind; pass `0` (default) for an OS-assigned ephemeral
@@ -81,6 +87,12 @@ public final class TLSBlockSensor {
                 self?.onClientHello?(host)
             }
             connection.cancel()
+        }
+        // Idle deadline: a peer that never sends leaves the receive completion unfired, so
+        // enforce an upper bound on the connection's lifetime. cancel() after completion is a
+        // safe no-op; the weak capture lets an already-closed connection deallocate.
+        queue.asyncAfter(deadline: .now() + idleTimeout) { [weak connection] in
+            connection?.cancel()
         }
     }
 }

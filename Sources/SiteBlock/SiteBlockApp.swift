@@ -30,11 +30,13 @@ struct SiteBlockApp: App {
             LaunchAtLogin.setEnabled(true)
             await model.reconcileOnLaunch()
 
-            // Poll the helper's block tallies so the menu shows live counts and a banner fires
-            // when a blocked site is hit. 5s keeps the notification timely without meaningful
-            // cost (a tiny local XPC round-trip).
+            // Poll the helper: block tallies for live counts/notifications, and re-verification
+            // of the hosts region so enforcement drift (an outside edit stripping the block) is
+            // detected and self-healed instead of the UI claiming "active" forever. 5s keeps the
+            // notification timely without meaningful cost (tiny local XPC round-trips).
             while !Task.isCancelled {
                 await model.refreshStats()
+                await model.verifyEnforcement()
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
             }
         }
