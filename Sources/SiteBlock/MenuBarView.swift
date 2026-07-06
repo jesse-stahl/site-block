@@ -1,4 +1,5 @@
 import SwiftUI
+import ServiceManagement
 import SiteBlockCore
 
 /// The menu bar popover: master toggle, add-domain field, and the domain list — with the gated
@@ -14,6 +15,9 @@ struct MenuBarView: View {
         VStack(alignment: .leading, spacing: 12) {
             header
             Divider()
+            if model.blockingStatus == .notEnforced {
+                notEnforcedBanner
+            }
             masterToggle
             addField
             domainList
@@ -35,14 +39,63 @@ struct MenuBarView: View {
 
     private var header: some View {
         HStack {
-            Image(systemName: model.isBlocking ? "lock.fill" : "lock.open")
-                .foregroundStyle(model.isBlocking ? Color.green : Color.secondary)
+            Image(systemName: statusIcon)
+                .foregroundStyle(statusColor)
             Text("SiteBlock").font(.headline)
             Spacer()
-            Text(model.isBlocking ? "Blocking on" : "Blocking off")
+            Text(statusLabel)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(model.blockingStatus == .notEnforced ? Color.orange : .secondary)
         }
+    }
+
+    // The header must reflect *actual* enforcement, never just intent — otherwise it would show a
+    // reassuring green lock while nothing is blocked (helper unapproved).
+    private var statusIcon: String {
+        switch model.blockingStatus {
+        case .active: return "lock.fill"
+        case .notEnforced: return "lock.trianglebadge.exclamationmark"
+        case .off: return "lock.open"
+        }
+    }
+
+    private var statusColor: Color {
+        switch model.blockingStatus {
+        case .active: return .green
+        case .notEnforced: return .orange
+        case .off: return .secondary
+        }
+    }
+
+    private var statusLabel: String {
+        switch model.blockingStatus {
+        case .active: return "Blocking on"
+        case .notEnforced: return "Not active"
+        case .off: return "Blocking off"
+        }
+    }
+
+    /// Shown when blocking is intended but not actually enforced — the one failure that would
+    /// otherwise silently defeat the whole app. Gives the user the exact fix.
+    private var notEnforcedBanner: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("Blocking isn’t active", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption.bold())
+                .foregroundStyle(.orange)
+            Text("The privileged helper isn’t approved, so no sites are actually being blocked. "
+                 + "Approve SiteBlock under “Allow in the Background,” then Retry.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            HStack {
+                Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
+                Button("Retry") { Task { await model.retryEnforcement() } }
+                    .buttonStyle(.borderedProminent)
+            }
+            .font(.caption)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.12)))
     }
 
     @ViewBuilder

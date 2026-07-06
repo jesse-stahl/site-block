@@ -40,6 +40,24 @@ final class HelperClient: HostsApplying, @unchecked Sendable {
         try await call { proxy, reply in proxy.removeBlock(withReply: reply) }
     }
 
+    /// Read the hosts currently in the live managed region (via the helper) so `AppModel` can
+    /// verify an apply actually landed. Surfaces connection failures as thrown errors.
+    func currentManagedHosts() async throws -> [String] {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[String], Error>) in
+            let resumed = ResumeGuard()
+            let proxy = connection.remoteObjectProxyWithErrorHandler { error in
+                if resumed.claim() { continuation.resume(throwing: error) }
+            }
+            guard let control = proxy as? HostsControlProtocol else {
+                if resumed.claim() { continuation.resume(throwing: HelperClientError.failed("Helper unavailable")) }
+                return
+            }
+            control.currentManagedHosts { hosts in
+                if resumed.claim() { continuation.resume(returning: hosts) }
+            }
+        }
+    }
+
     /// Bridge an XPC call (completion-handler based) into async/await, surfacing both connection
     /// errors and helper-reported failures.
     private func call(_ body: @escaping (HostsControlProtocol, @escaping (Bool, String?) -> Void) -> Void) async throws {

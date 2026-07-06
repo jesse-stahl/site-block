@@ -34,8 +34,18 @@ struct SiteBlockApp: App {
         MenuBarExtra {
             MenuBarView(model: model)
         } label: {
-            Image(systemName: model.isBlocking ? "lock.fill" : "lock.open")
+            // Reflect real enforcement: a warning badge when blocking is intended but not actually
+            // active (helper unapproved), so the menu bar never shows a false "locked" state.
+            Image(systemName: menuBarIcon)
         }
         .menuBarExtraStyle(.window)
+    }
+
+    private var menuBarIcon: String {
+        switch model.blockingStatus {
+        case .active: return "lock.fill"
+        case .notEnforced: return "lock.trianglebadge.exclamationmark"
+        case .off: return "lock.open"
+        }
     }
 }

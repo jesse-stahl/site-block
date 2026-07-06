@@ -4,9 +4,27 @@ import XCTest
 private final class FakeHosts: HostsApplying, @unchecked Sendable {
     var applied: [[String]] = []
     var removeCount = 0
-    func apply(_ hosts: [String]) async throws { applied.append(hosts) }
-    func removeBlock() async throws { removeCount += 1 }
+    /// What's actually "live" in the system — what `currentManagedHosts()` reports back.
+    var live: [String] = []
+    /// Simulate the helper being unreachable (e.g. not approved): `apply` throws.
+    var applyError: Error?
+    /// Simulate the insidious case: `apply` returns success but nothing lands in the system
+    /// (the unapproved helper never ran). Verification must still flag this as not-enforced.
+    var dropWrites = false
+    func apply(_ hosts: [String]) async throws {
+        if let applyError { throw applyError }
+        applied.append(hosts)
+        if !dropWrites { live = hosts }
+    }
+    func removeBlock() async throws {
+        if let applyError { throw applyError }
+        removeCount += 1
+        live = []
+    }
+    func currentManagedHosts() async throws -> [String] { live }
 }
+
+private struct FakeHostsError: Error {}
 
 private final class FakeAuth: PasswordAuthenticating, @unchecked Sendable {
     var succeed = true
@@ -207,6 +225,77 @@ final class AppModelTests: XCTestCase {
         model.cancelPending()
         XCTAssertNil(model.pending)
         XCTAssertNil(model.cooldownRemaining)
+    }
+
+    // MARK: enforcement verification (the "icon must not lie" fix)
+
+    func testSuccessfulPushIsVerifiedActive() async {
+        let (model, _, _, _) = makeModel()
+        await model.turnBlockingOn()
+        await model.addDomain("facebook.com")
+        XCTAssertTrue(model.systemBlockVerified)
+        XCTAssertEqual(model.blockingStatus, .active)
+    }
+
+    func testSilentApplyFailureIsReportedNotEnforced() async {
+        // apply() "succeeds" but nothing lands in the system (unapproved helper never ran).
+        let (model, hosts, _, _) = makeModel()
+        hosts.dropWrites = true
+        await model.turnBlockingOn()
+        await model.addDomain("facebook.com")
+        XCTAssertTrue(model.isBlocking, "intent is still on")
+        XCTAssertFalse(model.systemBlockVerified, "but nothing actually landed")
+        XCTAssertEqual(model.blockingStatus, .notEnforced)
+        XCTAssertNotNil(model.status, "the failure is surfaced, not swallowed")
+    }
+
+    func testThrowingApplyIsReportedNotEnforced() async {
+        let (model, hosts, _, _) = makeModel()
+        hosts.applyError = FakeHostsError()
+        await model.turnBlockingOn()
+        XCTAssertTrue(model.isBlocking)
+        XCTAssertEqual(model.blockingStatus, .notEnforced)
+        XCTAssertNotNil(model.status)
+    }
+
+    func testRetryEnforcementRecoversAfterApproval() async {
+        // Fails first (helper not approved), then the user approves and hits Retry.
+        let (model, hosts, _, _) = makeModel()
+        hosts.applyError = FakeHostsError()
+        await model.turnBlockingOn()
+        await model.addDomain("facebook.com")
+        XCTAssertEqual(model.blockingStatus, .notEnforced)
+
+        hosts.applyError = nil // approval granted
+        await model.retryEnforcement()
+        XCTAssertEqual(model.blockingStatus, .active)
+        XCTAssertTrue(model.systemBlockVerified)
+        XCTAssertNil(model.status)
+    }
+
+    func testRetryEnforcementDoesNotDisturbPendingWeaken() async {
+        let (model, hosts, _, clock) = makeModel()
+        await model.turnBlockingOn()
+        model.requestTurnOff()
+        clock.advance(60)
+        model.tick()
+        XCTAssertEqual(model.pending, .turnOff)
+
+        await model.retryEnforcement()
+        XCTAssertEqual(model.pending, .turnOff, "retry must not clear an in-flight weaken")
+        XCTAssertNotNil(model.cooldownRemaining)
+    }
+
+    func testTurnedOffIsStatusOff() async {
+        let (model, _, _, clock) = makeModel()
+        await model.turnBlockingOn()
+        XCTAssertEqual(model.blockingStatus, .active)
+        model.requestTurnOff()
+        clock.now = t0.addingTimeInterval(330)
+        model.tick()
+        _ = await model.confirmPending()
+        XCTAssertEqual(model.blockingStatus, .off)
+        XCTAssertFalse(model.systemBlockVerified)
     }
 
     // MARK: lifecycle

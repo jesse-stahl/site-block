@@ -11,6 +11,7 @@ private final class DiskHosts: HostsApplying, @unchecked Sendable {
     init(path: URL) { writer = HostsFileWriter(path: path) }
     func apply(_ hosts: [String]) async throws { try writer.apply(hosts) }
     func removeBlock() async throws { try writer.removeRegion() }
+    func currentManagedHosts() async throws -> [String] { try writer.currentManagedHosts() }
 }
 
 private final class OKAuth: PasswordAuthenticating, @unchecked Sendable {

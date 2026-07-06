@@ -7,6 +7,10 @@ public protocol HostsApplying {
     func apply(_ hosts: [String]) async throws
     /// Remove the block entirely.
     func removeBlock() async throws
+    /// The hosts currently enforced in the system's managed region. Used to *verify* that an
+    /// `apply` actually landed — a call returning success doesn't prove the privileged helper ran
+    /// (e.g. it hasn't been approved), so we read the live region back to confirm.
+    func currentManagedHosts() async throws -> [String]
 }
 
 /// Presents the secure Mac-password prompt used to confirm a weaken action.
@@ -36,10 +40,24 @@ public final class AppModel: ObservableObject {
         case removeDomain(String)
     }
 
+    /// How enforcement in the *system* stands relative to the user's intent.
+    public enum BlockingStatus: Equatable {
+        /// Blocking is intentionally off.
+        case off
+        /// Blocking is on AND verified to be enforced in `/etc/hosts` right now.
+        case active
+        /// Blocking is on (intent) but the system write has NOT landed — nothing is actually
+        /// blocked (typically the privileged helper isn't approved). The UI must surface this.
+        case notEnforced
+    }
+
     @Published public private(set) var blockList: BlockList
     @Published public private(set) var friction: FrictionMachine
     @Published public private(set) var pending: PendingWeaken?
     @Published public private(set) var status: String?
+    /// Whether the last enforcement attempt was verified to have landed in the system. This is the
+    /// *truth* about blocking, as opposed to `blockList.isBlocking`, which is only the user's intent.
+    @Published public private(set) var systemBlockVerified: Bool = false
     /// The last observed time, refreshed on every `tick()` — used by the display helpers.
     @Published public private(set) var now: Date
 
@@ -64,6 +82,22 @@ public final class AppModel: ObservableObject {
 
     public var isBlocking: Bool { blockList.isBlocking }
     public var domains: [String] { blockList.domains }
+
+    /// The truthful blocking state for the UI: distinguishes "on and actually enforced" from
+    /// "on but not enforced" (helper unapproved / write failed) so the app can never claim it's
+    /// blocking when it isn't.
+    public var blockingStatus: BlockingStatus {
+        guard blockList.isBlocking else { return .off }
+        return systemBlockVerified ? .active : .notEnforced
+    }
+
+    /// Re-attempt to enforce the current intent in the system. For the "Retry" action after the
+    /// user approves the helper — deliberately does not touch the friction timer or any pending
+    /// weaken action.
+    public func retryEnforcement() async {
+        if blockList.isBlocking { await pushToSystem() }
+        else { await removeFromSystem() }
+    }
 
     // MARK: - Strengthen actions (instant, ungated)
 
@@ -206,12 +240,32 @@ public final class AppModel: ObservableObject {
     }
 
     private func pushToSystem() async {
-        do { try await hosts.apply(blockList.allBlockedHosts()) }
-        catch { status = "Couldn't update blocking: \(error.localizedDescription)" }
+        do {
+            let expected = blockList.allBlockedHosts()
+            try await hosts.apply(expected)
+            // Verify the write actually landed. `apply` returning without throwing does NOT prove
+            // the privileged helper ran (an unapproved helper never starts, yet the XPC layer can
+            // still resolve) — so read the live managed region back and confirm our hosts are there.
+            let live = try await hosts.currentManagedHosts()
+            if Set(expected).isSubset(of: Set(live)) {
+                systemBlockVerified = true
+                status = nil
+            } else {
+                systemBlockVerified = false
+                status = "Blocking isn't active — approve SiteBlock's helper in Login Items, then Retry."
+            }
+        } catch {
+            systemBlockVerified = false
+            status = "Blocking isn't active — \(error.localizedDescription)"
+        }
     }
 
     private func removeFromSystem() async {
-        do { try await hosts.removeBlock() }
-        catch { status = "Couldn't update blocking: \(error.localizedDescription)" }
+        do {
+            try await hosts.removeBlock()
+            systemBlockVerified = false
+        } catch {
+            status = "Couldn't update blocking: \(error.localizedDescription)"
+        }
     }
 }
