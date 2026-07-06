@@ -17,31 +17,34 @@ public enum TLSClientHello {
         guard reader.skip(2) else { return nil }
         guard let recordLength = reader.readUInt16() else { return nil }
         guard reader.remaining >= Int(recordLength) else { return nil }
+        // Constrain all further parsing to the record body: bytes beyond it (e.g. a second TLS
+        // record coalesced into the same TCP read) must never satisfy inner length fields.
+        var recordReader = Reader(reader.slice(Int(recordLength)))
 
         // Handshake header: msg type (0x01 = ClientHello), 3-byte length.
-        guard let handshakeType = reader.readByte(), handshakeType == 0x01 else { return nil }
-        guard let helloLength = reader.readUInt24() else { return nil }
-        guard reader.remaining >= helloLength else { return nil }
+        guard let handshakeType = recordReader.readByte(), handshakeType == 0x01 else { return nil }
+        guard let helloLength = recordReader.readUInt24() else { return nil }
+        guard recordReader.remaining >= helloLength else { return nil }
 
         // client_version(2) + random(32).
-        guard reader.skip(2 + 32) else { return nil }
+        guard recordReader.skip(2 + 32) else { return nil }
 
         // session_id: 1-byte length prefix.
-        guard let sessionIDLength = reader.readByte() else { return nil }
-        guard reader.skip(Int(sessionIDLength)) else { return nil }
+        guard let sessionIDLength = recordReader.readByte() else { return nil }
+        guard recordReader.skip(Int(sessionIDLength)) else { return nil }
 
         // cipher_suites: 2-byte length prefix (in bytes).
-        guard let cipherSuitesLength = reader.readUInt16() else { return nil }
-        guard reader.skip(Int(cipherSuitesLength)) else { return nil }
+        guard let cipherSuitesLength = recordReader.readUInt16() else { return nil }
+        guard recordReader.skip(Int(cipherSuitesLength)) else { return nil }
 
         // compression_methods: 1-byte length prefix.
-        guard let compressionMethodsLength = reader.readByte() else { return nil }
-        guard reader.skip(Int(compressionMethodsLength)) else { return nil }
+        guard let compressionMethodsLength = recordReader.readByte() else { return nil }
+        guard recordReader.skip(Int(compressionMethodsLength)) else { return nil }
 
         // extensions: 2-byte total length, then a sequence of (type:2, length:2, body).
-        guard let extensionsLength = reader.readUInt16() else { return nil }
-        guard reader.remaining >= Int(extensionsLength) else { return nil }
-        var extensionsReader = Reader(reader.slice(Int(extensionsLength)))
+        guard let extensionsLength = recordReader.readUInt16() else { return nil }
+        guard recordReader.remaining >= Int(extensionsLength) else { return nil }
+        var extensionsReader = Reader(recordReader.slice(Int(extensionsLength)))
 
         while extensionsReader.remaining > 0 {
             guard let extType = extensionsReader.readUInt16() else { return nil }
@@ -62,11 +65,14 @@ public enum TLSClientHello {
         var reader = Reader(body)
         guard let listLength = reader.readUInt16() else { return nil }
         guard reader.remaining >= Int(listLength) else { return nil }
+        // Constrain iteration to the declared list length — trailing bytes beyond it in a
+        // malformed extension body must not be read as entries.
+        var listReader = Reader(reader.slice(Int(listLength)))
 
-        while reader.remaining > 0 {
-            guard let nameType = reader.readByte() else { return nil }
-            guard let nameLength = reader.readUInt16() else { return nil }
-            guard let nameBytes = reader.takeSlice(Int(nameLength)) else { return nil }
+        while listReader.remaining > 0 {
+            guard let nameType = listReader.readByte() else { return nil }
+            guard let nameLength = listReader.readUInt16() else { return nil }
+            guard let nameBytes = listReader.takeSlice(Int(nameLength)) else { return nil }
 
             guard nameType == 0x00 else { continue }
             guard let name = String(data: nameBytes, encoding: .ascii) else { return nil }

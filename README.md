@@ -39,9 +39,10 @@ walkthrough is in [`docs/MANUAL_VERIFICATION.md`](docs/MANUAL_VERIFICATION.md).
 
 ## What's automatically tested vs. manually verified
 
-- **Automated (`swift test`, 57 tests):** every pure behavior — domain expansion, the hosts
+- **Automated (`swift test`):** every pure behavior — domain expansion, the hosts
   managed-region render/apply/remove + atomic write, the 5-min→2-min friction machine, JSON
-  persistence, the loopback blocked-page server, and all of `AppModel`'s instant-vs-gated logic.
+  persistence, the loopback blocked-page server and TLS SNI sensor, block-attempt counting,
+  and all of `AppModel`'s instant-vs-gated logic.
 - **Manual (needs a signed build on a live login session with admin approval — cannot run in
   headless CI):** the `SMAppService` helper registration, the one-time admin prompt, real
   `/etc/hosts` blocking across Chrome/Firefox/Safari, the on-screen password confirmation, and

@@ -340,6 +340,38 @@ final class AppModelTests: XCTestCase {
         XCTAssertNotNil(model.status)
     }
 
+    func testStaleExtraHostsFailVerification() async {
+        // Verification requires exact equality: after a removal, a silently-failed write that
+        // leaves the old (larger) region live must not pass as "the removal landed".
+        let (model, hosts, _, clock) = makeModel()
+        await model.turnBlockingOn()
+        await model.addDomain("facebook.com")
+        await model.addDomain("x.com")
+        XCTAssertEqual(model.blockingStatus, .active)
+
+        // Remove x.com through the gate, but the write never lands (old region stays live).
+        hosts.dropWrites = true
+        model.requestRemove("x.com")
+        clock.now = t0.addingTimeInterval(330)
+        model.tick()
+        let ok = await model.confirmPending()
+        XCTAssertTrue(ok, "the gated action itself completes")
+        XCTAssertEqual(model.blockingStatus, .notEnforced,
+                       "but the live superset must fail verification, not pass as a subset match")
+    }
+
+    func testVerifyEnforcementHealsAwayStaleExtraHosts() async {
+        let (model, hosts, _, _) = makeModel()
+        await model.turnBlockingOn()
+        await model.addDomain("facebook.com")
+
+        // Drift: something re-adds an extra host to the live region.
+        hosts.live.append("stale.example.com")
+        await model.verifyEnforcement()
+        XCTAssertEqual(model.blockingStatus, .active)
+        XCTAssertFalse(hosts.live.contains("stale.example.com"), "heal re-applied the exact set")
+    }
+
     func testVerifyEnforcementIsQuietWhenAllGood() async {
         let (model, hosts, _, _) = makeModel()
         await model.turnBlockingOn()

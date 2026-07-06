@@ -139,7 +139,7 @@ public final class AppModel: ObservableObject {
         // Unreachable helper → we can no longer vouch for enforcement; pushToSystem below will
         // set the precise status message.
         let live = (try? await hosts.currentManagedHosts()) ?? []
-        if Set(expected).isSubset(of: Set(live)) {
+        if Set(expected) == Set(live) {
             systemBlockVerified = true
             return
         }
@@ -338,9 +338,11 @@ public final class AppModel: ObservableObject {
             try await hosts.apply(expected)
             // Verify the write actually landed. `apply` returning without throwing does NOT prove
             // the privileged helper ran (an unapproved helper never starts, yet the XPC layer can
-            // still resolve) — so read the live managed region back and confirm our hosts are there.
+            // still resolve) — so read the live managed region back and require it to be EXACTLY
+            // what we asked for. Equality (not subset) matters for removals: a failed write that
+            // left the old, larger region live must not pass as "the removal landed".
             let live = try await hosts.currentManagedHosts()
-            if Set(expected).isSubset(of: Set(live)) {
+            if Set(expected) == Set(live) {
                 systemBlockVerified = true
                 status = nil
             } else {
