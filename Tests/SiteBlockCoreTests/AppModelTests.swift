@@ -132,6 +132,45 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.pending)
     }
 
+    func testStartingTurnOffMidRemovalIsIgnored() async {
+        // Friction-bypass guard: while a domain removal is cooling, hitting "turn off" must not
+        // hijack the in-flight timer.
+        let (model, _, _, clock) = makeModel()
+        await model.turnBlockingOn()
+        await model.addDomain("facebook.com")
+
+        model.requestRemove("facebook.com")
+        // Its cooldown has already elapsed (armed).
+        clock.now = t0.addingTimeInterval(330)
+        model.tick()
+
+        // Attempt to turn off now — must be ignored (removal still the pending action).
+        model.requestTurnOff()
+        XCTAssertEqual(model.pending, .removeDomain("facebook.com"))
+
+        let ok = await model.confirmPending()
+        XCTAssertTrue(ok)
+        XCTAssertTrue(model.isBlocking, "blocking stays on — only the domain was removed")
+        XCTAssertEqual(model.domains, [])
+    }
+
+    func testCancelDuringAuthDoesNotApplyStaleAction() async {
+        // Reentrancy guard: if the pending action changes while the auth prompt is up (user
+        // cancels mid-prompt), the resolving confirm must not apply the old action. The auth hook
+        // runs on the main actor synchronously inside `confirmPending`'s await point.
+        let (model, hosts, auth, clock) = makeModel()
+        await model.turnBlockingOn()
+        model.requestTurnOff()
+        clock.now = t0.addingTimeInterval(330)
+        model.tick()
+        auth.onAuthenticate = { [weak model] in model?.cancelPending() } // user cancels mid-prompt
+
+        let ok = await model.confirmPending()
+        XCTAssertFalse(ok, "cancelled action must not apply")
+        XCTAssertTrue(model.isBlocking)
+        XCTAssertEqual(hosts.removeCount, 0)
+    }
+
     func testExpiredWindowClearsPending() async {
         let (model, _, _, clock) = makeModel()
         await model.turnBlockingOn()

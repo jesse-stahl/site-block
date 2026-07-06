@@ -91,16 +91,19 @@ public final class AppModel: ObservableObject {
 
     // MARK: - Weaken actions (gated: cooldown -> window -> password)
 
-    /// Begin turning blocking off. Starts the friction cooldown.
+    /// Begin turning blocking off. Starts the friction cooldown. No-op if another weaken action
+    /// is already in flight — otherwise the new action would inherit the in-progress timer and
+    /// bypass its own cooldown.
     public func requestTurnOff() {
-        guard blockList.isBlocking else { return }
+        guard blockList.isBlocking, pending == nil else { return }
         pending = .turnOff
         friction.request(now: clock())
     }
 
-    /// Begin removing a domain. Starts the friction cooldown.
+    /// Begin removing a domain. Starts the friction cooldown. No-op if another weaken action is
+    /// already in flight (see `requestTurnOff`).
     public func requestRemove(_ domain: String) {
-        guard blockList.domains.contains(domain) else { return }
+        guard blockList.domains.contains(domain), pending == nil else { return }
         pending = .removeDomain(domain)
         friction.request(now: clock())
     }
@@ -130,11 +133,11 @@ public final class AppModel: ObservableObject {
     @discardableResult
     public func confirmPending() async -> Bool {
         now = clock()
-        guard let pending else { return false }
+        guard let action = pending else { return false }
         guard friction.canConfirm(now: now) else { return false }
 
         let reason: String
-        switch pending {
+        switch action {
         case .turnOff: reason = "turn off website blocking"
         case .removeDomain(let d): reason = "remove \(d) from your block list"
         }
@@ -142,6 +145,11 @@ public final class AppModel: ObservableObject {
             status = "Authentication cancelled."
             return false
         }
+
+        // The await above suspended the main actor: the user may have cancelled and started a
+        // different weaken action while the prompt was up. Only proceed if the pending action is
+        // still the exact one we authenticated for.
+        guard self.pending == action else { return false }
 
         // Re-evaluate against the current time — the auth prompt may have outlasted the window.
         let afterAuth = clock()
@@ -153,7 +161,7 @@ public final class AppModel: ObservableObject {
             return false
         }
 
-        switch pending {
+        switch action {
         case .turnOff:
             blockList.isBlocking = false
             persist()

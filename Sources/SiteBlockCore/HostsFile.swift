@@ -27,39 +27,37 @@ public enum HostsFile {
         return lines.joined(separator: "\n")
     }
 
-    /// Return `content` with the managed region set to `hosts`. If a region already exists it is
-    /// replaced in place; otherwise the region is appended. If `hosts` is empty, any existing
-    /// region is removed instead (an empty region would be pointless).
+    /// Return `content` with the managed region set to exactly `hosts`. Any pre-existing managed
+    /// region(s) are stripped first and a single fresh region is appended, so the result always
+    /// contains exactly one region even if the input was somehow malformed (e.g. a duplicated
+    /// begin marker). If `hosts` is empty, the region is simply removed.
     public static func applying(_ hosts: [String], to content: String) -> String {
-        guard !hosts.isEmpty else { return removing(from: content) }
+        let cleaned = removing(from: content)
+        guard !hosts.isEmpty else { return cleaned }
 
         let region = renderRegion(hosts)
-        if let range = regionLineRange(in: content) {
-            var lines = splitLines(content)
-            lines.replaceSubrange(range, with: [region])
-            return lines.joined(separator: "\n")
-        }
-        // Append, guaranteeing exactly one blank separation from prior content.
-        if content.isEmpty {
+        if cleaned.isEmpty {
             return region + "\n"
         }
-        let base = content.hasSuffix("\n") ? content : content + "\n"
+        let base = cleaned.hasSuffix("\n") ? cleaned : cleaned + "\n"
         return base + region + "\n"
     }
 
-    /// Return `content` with the managed region (and its markers) removed. Content outside the
-    /// region is preserved. No-op if there is no region.
+    /// Return `content` with every managed region (and its markers) removed. Content outside the
+    /// regions is preserved. No-op if there is no region. Handles duplicated/nested markers by
+    /// removing each complete begin…end span until none remain.
     public static func removing(from content: String) -> String {
-        guard let range = regionLineRange(in: content) else { return content }
         var lines = splitLines(content)
-        lines.removeSubrange(range)
+        while let range = regionLineRange(in: lines) {
+            lines.removeSubrange(range)
+        }
         return lines.joined(separator: "\n")
     }
 
     /// The hosts currently listed in the managed region, in order, deduplicated.
     public static func managedHosts(in content: String) -> [String] {
-        guard let range = regionLineRange(in: content) else { return [] }
         let lines = splitLines(content)
+        guard let range = regionLineRange(in: lines) else { return [] }
         var hosts: [String] = []
         var seen = Set<String>()
         let prefix = "\(loopbackIPv4) "
@@ -76,9 +74,9 @@ public enum HostsFile {
 
     // MARK: - Internals
 
-    /// The inclusive line-index range of the managed region (begin marker … end marker), or nil.
-    private static func regionLineRange(in content: String) -> Range<Int>? {
-        let lines = splitLines(content)
+    /// The inclusive line-index range of the first managed region (begin marker … end marker),
+    /// or nil. Callers loop to strip multiple regions.
+    private static func regionLineRange(in lines: [String]) -> Range<Int>? {
         guard let begin = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == beginMarker }),
               let end = lines[begin...].firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == endMarker })
         else { return nil }

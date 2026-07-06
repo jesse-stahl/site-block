@@ -58,6 +58,8 @@ struct MenuBarView: View {
                     Label("Turn off blocking…", systemImage: "hourglass")
                         .frame(maxWidth: .infinity)
                 }
+                // Only one weaken action at a time (e.g. don't start turn-off mid domain-removal).
+                .disabled(model.pending != nil)
             }
         } else {
             Button {

@@ -90,6 +90,30 @@ final class HostsFileTests: XCTestCase {
         XCTAssertEqual(HostsFile.managedHosts(in: preamble), [])
     }
 
+    func testRemovingStripsAllRegionsIncludingDuplicates() {
+        // A malformed file with two managed regions (e.g. from manual tampering) must be fully
+        // cleaned — no orphaned region left behind.
+        let doubled = HostsFile.applying(["a.com"], to: preamble) + "\n"
+            + HostsFile.renderRegion(["b.com"]) + "\n"
+        XCTAssertEqual(doubled.components(separatedBy: HostsFile.beginMarker).count - 1, 2)
+        let cleaned = HostsFile.removing(from: doubled)
+        XCTAssertFalse(cleaned.contains(HostsFile.beginMarker))
+        XCTAssertFalse(cleaned.contains("a.com"))
+        XCTAssertFalse(cleaned.contains("b.com"))
+        XCTAssertTrue(cleaned.contains("broadcasthost"), "non-managed content preserved")
+    }
+
+    func testApplyingCollapsesDuplicateRegionsToOne() {
+        let doubled = HostsFile.applying(["a.com"], to: preamble) + "\n"
+            + HostsFile.renderRegion(["b.com"]) + "\n"
+        let result = HostsFile.applying(["c.com"], to: doubled)
+        XCTAssertEqual(result.components(separatedBy: HostsFile.beginMarker).count - 1, 1,
+                       "exactly one managed region after apply")
+        XCTAssertTrue(result.contains("127.0.0.1 c.com"))
+        XCTAssertFalse(result.contains("a.com"))
+        XCTAssertFalse(result.contains("b.com"))
+    }
+
     // MARK: HostsFileWriter (atomic file I/O)
 
     func testWriterApplyReadRemoveRoundTrip() throws {
