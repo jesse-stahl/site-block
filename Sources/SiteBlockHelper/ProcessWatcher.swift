@@ -32,8 +32,8 @@ struct PosixSignaler: ProcessSignaling {
 }
 
 /// Owns the enforcer, persists the blocked set, and runs the 1-second sweep timer — but ONLY while
-/// there is something to enforce, so an empty set costs nothing. All enforcer access is on one
-/// serial queue (the enforcer itself is not thread-safe).
+/// there is something to enforce, so an empty set costs nothing. All enforcer access — and the
+/// `onAttempt` callback — is on one serial queue (the enforcer itself is not thread-safe).
 final class ProcessWatcher {
 
     private let queue = DispatchQueue(label: "today.siteblock.helper.processwatcher")
@@ -41,27 +41,37 @@ final class ProcessWatcher {
     private let store: BlockedAppsStore
     private var timer: DispatchSourceTimer?
     /// Called (on `queue`) with each blocked bundle id whose launch was just stopped.
-    var onAttempt: ((String) -> Void)?
+    private let onAttempt: (String) -> Void
 
-    init(store: BlockedAppsStore) {
+    init(store: BlockedAppsStore, onAttempt: @escaping (String) -> Void) {
         self.store = store
+        self.onAttempt = onAttempt
         self.enforcer = AppBlockEnforcer(
             processes: LibprocProcessLister(),
             signals: PosixSignaler(),
             protectedBundleIDs: ["today.siteblock.SiteBlock"],
             ownPID: getpid())
-        // Restore the persisted set so app blocking survives a reboot even if the menu bar app
-        // hasn't launched yet (Discord/Steam auto-start at login).
+    }
+
+    /// Restore the persisted set so app blocking survives a reboot even if the menu bar app
+    /// hasn't launched yet (Discord/Steam auto-start at login).
+    func start() {
         let saved = (try? store.load()) ?? []
         if !saved.isEmpty { setBlockedApps(saved) }
     }
 
     /// Replace the enforced set (kills running matches immediately, silently) and persist it.
-    func setBlockedApps(_ bundleIDs: [String]) {
+    /// `completion` runs on `queue` once the set is live, with the persistence error if the
+    /// write failed — the set is enforced in memory either way, but a caller must know that it
+    /// will not survive a reboot. Re-applying an identical set is a no-op (no sweep, no write).
+    func setBlockedApps(_ bundleIDs: [String], completion: ((Error?) -> Void)? = nil) {
         queue.async { [self] in
-            enforcer.setBlockedBundleIDs(bundleIDs, now: Date())
-            try? store.save(bundleIDs)
+            var saveError: Error?
+            if enforcer.setBlockedBundleIDs(bundleIDs, now: Date()) {
+                do { try store.save(bundleIDs) } catch { saveError = error }
+            }
             bundleIDs.isEmpty ? stopTimer() : startTimerIfNeeded()
+            completion?(saveError)
         }
     }
 
@@ -76,7 +86,7 @@ final class ProcessWatcher {
         t.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(200))
         t.setEventHandler { [weak self] in
             guard let self else { return }
-            for id in enforcer.sweep(now: Date()) { onAttempt?(id) }
+            for id in enforcer.sweep(now: Date()) { onAttempt(id) }
         }
         t.resume()
         timer = t

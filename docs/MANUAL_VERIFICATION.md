@@ -145,6 +145,9 @@ This is the core safety mechanism — test it carefully.
 - To manually clear a stuck block: open `/etc/hosts` with `sudo`, delete the lines
   between (and including) the two marker comments, save, and flush DNS
   (`sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder`).
+- To manually clear a stuck **app** block (the helper restores its set at boot, independent of
+  the UI): `sudo rm "/Library/Application Support/SiteBlock/blockedapps.json"`, then restart the
+  helper (`sudo launchctl kickstart -k system/today.siteblock.helper`) or reboot.
 
 ## 9. App blocking (Discord / Steam)
 

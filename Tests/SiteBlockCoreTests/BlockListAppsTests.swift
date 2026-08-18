@@ -18,6 +18,21 @@ final class BlockListAppsTests: XCTestCase {
         XCTAssertTrue(list.apps.isEmpty)
     }
 
+    func testAddAppRejectsNeverBlockableApps() {
+        var list = BlockList()
+        XCTAssertFalse(list.addApp(bundleID: "com.apple.Finder", name: "Finder"))
+        XCTAssertFalse(list.addApp(bundleID: "today.siteblock.SiteBlock", name: "SiteBlock"))
+        XCTAssertTrue(list.apps.isEmpty)
+        XCTAssertFalse(AppBlockPolicy.isBlockable("COM.APPLE.LOGINWINDOW"))
+        XCTAssertTrue(AppBlockPolicy.isBlockable("com.hnc.Discord"))
+    }
+
+    func testAppLookupReturnsCanonicalEntry() {
+        let list = BlockList(apps: [BlockedApp(bundleID: "com.hnc.Discord", name: "Discord")])
+        XCTAssertEqual(list.app(for: "COM.HNC.DISCORD")?.bundleID, "com.hnc.Discord")
+        XCTAssertNil(list.app(for: "com.nothere"))
+    }
+
     func testRemoveApp() {
         var list = BlockList(apps: [BlockedApp(bundleID: "com.hnc.Discord", name: "Discord"),
                                     BlockedApp(bundleID: "com.valvesoftware.steam", name: "Steam")])

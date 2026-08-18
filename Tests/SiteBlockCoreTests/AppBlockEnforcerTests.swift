@@ -122,6 +122,55 @@ final class AppBlockEnforcerTests: XCTestCase {
         XCTAssertTrue(sigs.terminated.isEmpty, "no bundle id resolvable → do not act on a guess")
     }
 
+    func testReapplyingIdenticalSetIsANoOp() {
+        // Routine re-pushes from the app (adding a domain, a 5s re-verify) must not reset the
+        // escalation clock, re-signal, or swallow an in-flight attempt via a silent baseline sweep.
+        let (enforcer, procs, sigs) = make()
+        XCTAssertTrue(enforcer.setBlockedBundleIDs(["com.hnc.Discord"], now: t0))
+        procs.processes = [discordMain]
+        XCTAssertEqual(enforcer.sweep(now: t0.addingTimeInterval(1)), ["com.hnc.Discord"])
+        XCTAssertFalse(enforcer.setBlockedBundleIDs(["com.hnc.Discord"], now: t0.addingTimeInterval(2)),
+                       "same set → nothing to do")
+        XCTAssertEqual(sigs.terminated, [100], "not re-terminated by a no-op re-apply")
+        _ = enforcer.sweep(now: t0.addingTimeInterval(4))
+        XCTAssertEqual(sigs.killed, [100], "escalation clock kept running from the original SIGTERM")
+        XCTAssertTrue(enforcer.setBlockedBundleIDs(["com.hnc.Discord", "com.valvesoftware.steam"], now: t0),
+                      "a different set is applied")
+    }
+
+    func testFailedBundleLookupIsRetriedNextSweep() {
+        // An app mid-self-update has no readable Info.plist for a moment; that must not disable
+        // blocking for it until the helper restarts.
+        var readable = false
+        var lookups = 0
+        let procs = FakeProcesses()
+        let sigs = FakeSignals()
+        let enforcer = AppBlockEnforcer(processes: procs, signals: sigs,
+                                        bundleIdentifier: { _ in lookups += 1; return readable ? "com.hnc.Discord" : nil },
+                                        forceKillAfter: 3, protectedBundleIDs: [], ownPID: 1)
+        enforcer.setBlockedBundleIDs(["com.hnc.Discord"], now: t0)
+        procs.processes = [discordMain]
+        XCTAssertEqual(enforcer.sweep(now: t0.addingTimeInterval(1)), [])
+        readable = true
+        XCTAssertEqual(enforcer.sweep(now: t0.addingTimeInterval(2)), ["com.hnc.Discord"], "nil was not cached")
+        _ = enforcer.sweep(now: t0.addingTimeInterval(3))
+        XCTAssertEqual(lookups, 2, "…but a successful lookup is")
+    }
+
+    func testPolicyProtectedAppsAreNeverSignalledEvenIfListed() {
+        // A hand-edited list naming Finder/loginwindow must not make root kill the session.
+        let procs = FakeProcesses()
+        let sigs = FakeSignals()
+        let enforcer = AppBlockEnforcer(processes: procs, signals: sigs,
+                                        bundleIdentifier: { _ in "com.apple.Finder" },
+                                        forceKillAfter: 3, protectedBundleIDs: [], ownPID: 1)
+        procs.processes = [RunningProcess(pid: 77, executablePath: "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder")]
+        enforcer.setBlockedBundleIDs(["com.apple.finder"], now: t0)
+        _ = enforcer.sweep(now: t0.addingTimeInterval(1))
+        XCTAssertTrue(sigs.terminated.isEmpty)
+        XCTAssertTrue(sigs.killed.isEmpty)
+    }
+
     func testClearingSetStopsEnforcement() {
         let (enforcer, procs, sigs) = make()
         procs.processes = [discordMain]

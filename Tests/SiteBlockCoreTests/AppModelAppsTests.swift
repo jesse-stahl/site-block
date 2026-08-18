@@ -3,8 +3,13 @@ import XCTest
 
 private final class FakeHosts: HostsApplying, @unchecked Sendable {
     var live: [String] = []
-    func apply(_ hosts: [String]) async throws { live = hosts }
-    func removeBlock() async throws { live = [] }
+    var applied: [[String]] = []
+    var removeError: Error?
+    func apply(_ hosts: [String]) async throws { applied.append(hosts); live = hosts }
+    func removeBlock() async throws {
+        if let removeError { throw removeError }
+        live = []
+    }
     func currentManagedHosts() async throws -> [String] { live }
 }
 
@@ -149,6 +154,46 @@ final class AppModelAppsTests: XCTestCase {
         XCTAssertEqual(model.blockingStatus, .off)
     }
 
+    func testTurnOffClearsAppsEvenWhenHostsRemovalFails() async {
+        // A failed hosts removal must never leave root killing the user's apps behind an "off"
+        // padlock — each half of the removal is attempted independently.
+        let (model, hosts, apps, _, _, _, clock) = makeModel()
+        await model.addApp(bundleID: discord, name: "Discord")
+        await model.turnBlockingOn()
+        hosts.removeError = FakeError()
+        model.requestTurnOff()
+        clock.advance(300); model.tick()
+        _ = await model.confirmPending()
+        XCTAssertEqual(model.blockingStatus, .off)
+        XCTAssertEqual(apps.live, [], "app half cleared despite the hosts failure")
+        XCTAssertNotNil(model.status, "the hosts failure is still surfaced")
+    }
+
+    func testVerifyEnforcementWhileOffClearsAStaleHelperAppSet() async {
+        // The helper still holds a set (a turn-off whose XPC call was dropped): the periodic
+        // check reconciles to the OFF intent instead of ignoring it.
+        let (model, _, apps, _, _, _, _) = makeModel()
+        apps.live = [discord]
+        await model.verifyEnforcement()
+        XCTAssertEqual(apps.live, [])
+        XCTAssertEqual(model.blockingStatus, .off)
+    }
+
+    func testStrippedAppsHealWithoutRewritingHosts() async {
+        // Only the drifted half is re-applied: a stuck app half must not cause a privileged
+        // /etc/hosts rewrite on every 5-second check.
+        let (model, hosts, apps, _, _, _, _) = makeModel()
+        await model.addDomain("facebook.com")
+        await model.addApp(bundleID: discord, name: "Discord")
+        await model.turnBlockingOn()
+        let hostsWrites = hosts.applied.count
+        apps.live = []
+        await model.verifyEnforcement()
+        XCTAssertEqual(apps.live, [discord])
+        XCTAssertEqual(hosts.applied.count, hostsWrites, "hosts matched → not rewritten")
+        XCTAssertEqual(model.blockingStatus, .active)
+    }
+
     // MARK: weaken — remove app is gated
 
     func testRemoveAppRequiresCooldownWindowAndAuth() async {
@@ -196,6 +241,17 @@ final class AppModelAppsTests: XCTestCase {
         XCTAssertEqual(model.pending, .turnOff, "second weaken action must not hijack the timer")
     }
 
+    func testRequestRemoveAppStoresTheCanonicalID() async {
+        // The row compares against the listed casing; a differently-cased request must still
+        // light up that row's pending UI.
+        let (model, _, _, _, _, _, _) = makeModel()
+        await model.addApp(bundleID: discord, name: "Discord")
+        model.requestRemoveApp("COM.HNC.DISCORD")
+        XCTAssertEqual(model.pending, .removeApp(discord))
+        XCTAssertTrue(model.isAppBlocked("com.hnc.discord"))
+        XCTAssertFalse(model.isAppBlocked("com.nothere"))
+    }
+
     // MARK: stats + notifications
 
     func testBlockedCountForAppUsesNamespacedKey() async {
@@ -204,6 +260,19 @@ final class AppModelAppsTests: XCTestCase {
         stats.stats = BlockStats(counts: ["app:com.hnc.discord": 4, "discord": 99])
         await model.refreshStats()
         XCTAssertEqual(model.blockedCount(forApp: discord), 4)
+    }
+
+    func testAppTalliesNeverFoldIntoADomainBySuffix() async {
+        // "app:com.example.app" ends in ".example.app" — the site "example.app" must not count it.
+        let (model, _, _, _, stats, notifier, _) = makeModel()
+        await model.addDomain("example.app")
+        await model.addApp(bundleID: "com.example.app", name: "Example")
+        await model.refreshStats()
+        stats.stats = BlockStats(counts: ["app:com.example.app": 3])
+        await model.refreshStats()
+        XCTAssertEqual(model.blockedCount(for: "example.app"), 0)
+        XCTAssertEqual(model.blockedCount(forApp: "com.example.app"), 3)
+        XCTAssertEqual(notifier.notifications.map(\.domain), ["Example"], "only the app is announced")
     }
 
     func testAppLaunchIncreaseNotifiesWithNameAndRateLimits() async {

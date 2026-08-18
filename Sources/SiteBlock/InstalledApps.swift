@@ -1,27 +1,20 @@
 import AppKit
+import SiteBlockCore
 
 /// An app the user can pick for blocking.
 struct InstalledApp: Identifiable, Hashable {
     let bundleID: String
     let name: String
-    let url: URL
     var id: String { bundleID.lowercased() }
 }
 
 /// Discovers candidate apps for the "Add app…" picker: everything in /Applications and
 /// ~/Applications (top level only) plus currently running regular apps (catches things installed
-/// elsewhere). SiteBlock itself and core system apps are excluded so the user can't lock
-/// themselves out.
+/// elsewhere). SiteBlock itself and the core system apps in `AppBlockPolicy.neverBlock` are
+/// excluded so they are never even offered (the enforcer refuses them independently).
 enum InstalledApps {
 
-    /// Apps that must never be offered for blocking.
-    static let excludedBundleIDs: Set<String> = [
-        "today.siteblock.siteblock",
-        "com.apple.finder", "com.apple.systempreferences", "com.apple.terminal",
-        "com.apple.activitymonitor", "com.apple.dock", "com.apple.loginwindow",
-        "com.apple.systemuiserver", "com.apple.controlcenter",
-    ]
-
+    /// Filesystem + Launch Services work: call off the main thread.
     static func discover() -> [InstalledApp] {
         var byID: [String: InstalledApp] = [:]
         let fm = FileManager.default
@@ -37,8 +30,9 @@ enum InstalledApps {
         for running in NSWorkspace.shared.runningApplications where running.activationPolicy == .regular {
             if let url = running.bundleURL, let app = installedApp(at: url) { byID[app.id] = app }
         }
+        let selfID = Bundle.main.bundleIdentifier?.lowercased()
         return byID.values
-            .filter { !excludedBundleIDs.contains($0.id) && $0.id != Bundle.main.bundleIdentifier?.lowercased() }
+            .filter { AppBlockPolicy.isBlockable($0.id) && $0.id != selfID }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
@@ -47,12 +41,22 @@ enum InstalledApps {
         let name = (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
             ?? (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String)
             ?? url.deletingPathExtension().lastPathComponent
-        return InstalledApp(bundleID: id, name: name, url: url)
+        return InstalledApp(bundleID: id, name: name)
     }
 
-    /// The Finder icon for an app, resolved by bundle id (nil if not installed any more).
-    static func icon(forBundleID bundleID: String) -> NSImage? {
-        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return nil }
-        return NSWorkspace.shared.icon(forFile: url.path)
+    /// Where each of `bundleIDs` is installed, keyed by bundle id (apps no longer installed are
+    /// absent). A Launch Services lookup per id — call off the main thread, once per list change.
+    static func paths(forBundleIDs bundleIDs: [String]) -> [String: String] {
+        var result: [String: String] = [:]
+        for id in bundleIDs {
+            result[id] = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id)?.path
+        }
+        return result
+    }
+
+    /// Finder icons for resolved app paths (see `paths(forBundleIDs:)`), keyed by bundle id.
+    /// Icon loads are served from the icon cache; the slow part is the lookup above.
+    static func icons(forPaths paths: [String: String]) -> [String: NSImage] {
+        paths.mapValues { NSWorkspace.shared.icon(forFile: $0) }
     }
 }

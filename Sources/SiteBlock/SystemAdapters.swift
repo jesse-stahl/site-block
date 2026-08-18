@@ -44,19 +44,7 @@ final class HelperClient: HostsApplying, AppBlockApplying, BlockStatsProviding, 
     /// Read the hosts currently in the live managed region (via the helper) so `AppModel` can
     /// verify an apply actually landed. Surfaces connection failures as thrown errors.
     func currentManagedHosts() async throws -> [String] {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[String], Error>) in
-            let resumed = ResumeGuard()
-            let proxy = connection.remoteObjectProxyWithErrorHandler { error in
-                if resumed.claim() { continuation.resume(throwing: error) }
-            }
-            guard let control = proxy as? HostsControlProtocol else {
-                if resumed.claim() { continuation.resume(throwing: HelperClientError.failed("Helper unavailable")) }
-                return
-            }
-            control.currentManagedHosts { hosts in
-                if resumed.claim() { continuation.resume(returning: hosts) }
-            }
-        }
+        try await request { proxy, reply in proxy.currentManagedHosts(withReply: reply) }
     }
 
     /// Apply the blocked-app set to the helper, which is the only component that can see and
@@ -67,24 +55,22 @@ final class HelperClient: HostsApplying, AppBlockApplying, BlockStatsProviding, 
 
     /// Read the app set the helper is enforcing, so `AppModel` can verify an apply landed.
     func currentBlockedApps() async throws -> [String] {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[String], Error>) in
-            let resumed = ResumeGuard()
-            let proxy = connection.remoteObjectProxyWithErrorHandler { error in
-                if resumed.claim() { continuation.resume(throwing: error) }
-            }
-            guard let control = proxy as? HostsControlProtocol else {
-                if resumed.claim() { continuation.resume(throwing: HelperClientError.failed("Helper unavailable")) }
-                return
-            }
-            control.currentBlockedApps { ids in
-                if resumed.claim() { continuation.resume(returning: ids) }
-            }
-        }
+        try await request { proxy, reply in proxy.currentBlockedApps(withReply: reply) }
     }
 
     /// Fetch the block-attempt tallies from the helper (JSON blob over XPC).
     func fetchBlockStats() async throws -> BlockStats {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<BlockStats, Error>) in
+        let data: Data? = try await request { proxy, reply in proxy.blockStats(withReply: reply) }
+        guard let data, let stats = try? JSONDecoder().decode(BlockStats.self, from: data) else {
+            throw HelperClientError.failed("Stats unavailable")
+        }
+        return stats
+    }
+
+    /// Bridge a helper *query* (single-value completion handler) into async/await, surfacing
+    /// connection errors as thrown errors.
+    private func request<T>(_ body: @escaping (HostsControlProtocol, @escaping (T) -> Void) -> Void) async throws -> T {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
             let resumed = ResumeGuard()
             let proxy = connection.remoteObjectProxyWithErrorHandler { error in
                 if resumed.claim() { continuation.resume(throwing: error) }
@@ -93,35 +79,19 @@ final class HelperClient: HostsApplying, AppBlockApplying, BlockStatsProviding, 
                 if resumed.claim() { continuation.resume(throwing: HelperClientError.failed("Helper unavailable")) }
                 return
             }
-            control.blockStats { data in
-                guard resumed.claim() else { return }
-                guard let data, let stats = try? JSONDecoder().decode(BlockStats.self, from: data) else {
-                    continuation.resume(throwing: HelperClientError.failed("Stats unavailable"))
-                    return
-                }
-                continuation.resume(returning: stats)
+            body(control) { value in
+                if resumed.claim() { continuation.resume(returning: value) }
             }
         }
     }
 
-    /// Bridge an XPC call (completion-handler based) into async/await, surfacing both connection
-    /// errors and helper-reported failures.
+    /// Bridge a helper *mutation* (`(ok, message)` completion handler) into async/await, surfacing
+    /// both connection errors and helper-reported failures.
     private func call(_ body: @escaping (HostsControlProtocol, @escaping (Bool, String?) -> Void) -> Void) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let resumed = ResumeGuard()
-            let proxy = connection.remoteObjectProxyWithErrorHandler { error in
-                if resumed.claim() { continuation.resume(throwing: error) }
-            }
-            guard let control = proxy as? HostsControlProtocol else {
-                if resumed.claim() { continuation.resume(throwing: HelperClientError.failed("Helper unavailable")) }
-                return
-            }
-            body(control) { ok, message in
-                guard resumed.claim() else { return }
-                if ok { continuation.resume() }
-                else { continuation.resume(throwing: HelperClientError.failed(message ?? "Unknown helper error")) }
-            }
+        let (ok, message): (Bool, String?) = try await request { control, reply in
+            body(control) { ok, message in reply((ok, message)) }
         }
+        if !ok { throw HelperClientError.failed(message ?? "Unknown helper error") }
     }
 }
 

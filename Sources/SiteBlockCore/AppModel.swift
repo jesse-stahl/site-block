@@ -97,7 +97,8 @@ public final class AppModel: ObservableObject {
     private let statsProvider: BlockStatsProviding?
     private let notifier: BlockNotifying?
     private let clock: () -> Date
-    /// Per-domain time of the last posted notification, for rate-limiting.
+    /// Time of the last posted notification per target, for rate-limiting. Keyed by the domain
+    /// for sites and by `BlockedApp.statsKey` for apps, so the two namespaces can't collide.
     private var lastNotified: [String: Date] = [:]
     /// Minimum gap between notifications for the same domain — a blocked page reload spree
     /// shouldn't buzz the user every few seconds.
@@ -151,25 +152,50 @@ public final class AppModel: ObservableObject {
     /// keep claiming `.active`. Re-applying is a *strengthen* action, so healing is ungated —
     /// only weakening goes through the friction gate. No-op while blocking is off.
     public func verifyEnforcement() async {
-        guard blockList.isBlocking else { return }
+        guard blockList.isBlocking else {
+            // Off is an intent too: a turn-off whose system removal partly failed (helper busy,
+            // XPC drop) must not leave root killing the user's apps behind an "off" padlock.
+            // Only the halves still live are touched, and this path is a weaken the user already
+            // paid the gate for.
+            let hostsLive = await hostsStillLive()
+            let appsLive = await appsStillLive()
+            if hostsLive || appsLive { await removeFromSystem() }
+            return
+        }
         // Unreachable helper → we can no longer vouch for enforcement; pushToSystem below will
         // set the precise status message. BOTH halves must match: a live hosts region with a
-        // stripped app set is not "enforced".
-        let hostsOK = Set(blockList.allBlockedHosts()) == Set((try? await hosts.currentManagedHosts()) ?? [])
+        // stripped app set is not "enforced" — but only the half that drifted is re-applied, so a
+        // stuck app half never causes a privileged /etc/hosts rewrite every 5 seconds.
+        let hostsOK = await hostsVerified()
         let appsOK = await appsVerified()
         if hostsOK && appsOK {
             systemBlockVerified = true
             return
         }
         systemBlockVerified = false
-        await pushToSystem()
+        await pushToSystem(hosts: !hostsOK, apps: !appsOK)
+    }
+
+    /// True if the live managed hosts region is exactly ours (unreachable helper → false).
+    private func hostsVerified() async -> Bool {
+        guard let live = try? await hosts.currentManagedHosts() else { return false }
+        return Set(live) == Set(blockList.allBlockedHosts())
     }
 
     /// True if the helper's live app set is exactly ours (or app blocking isn't wired up).
     private func appsVerified() async -> Bool {
         guard let appBlocker else { return true }
-        let live = (try? await appBlocker.currentBlockedApps()) ?? []
+        guard let live = try? await appBlocker.currentBlockedApps() else { return false }
         return Set(live) == Set(blockList.blockedBundleIDs())
+    }
+
+    private func hostsStillLive() async -> Bool {
+        !((try? await hosts.currentManagedHosts()) ?? []).isEmpty
+    }
+
+    private func appsStillLive() async -> Bool {
+        guard let appBlocker else { return false }
+        return !((try? await appBlocker.currentBlockedApps()) ?? []).isEmpty
     }
 
     // MARK: - Strengthen actions (instant, ungated)
@@ -231,9 +257,16 @@ public final class AppModel: ObservableObject {
     /// Begin removing an app. Starts the friction cooldown. No-op if another weaken action is
     /// already in flight (see `requestTurnOff`).
     public func requestRemoveApp(_ bundleID: String) {
-        guard blockList.appName(for: bundleID) != nil, pending == nil else { return }
-        pending = .removeApp(bundleID)
+        // Store the canonical id (as listed), so the pending state matches the row regardless of
+        // the casing the caller passed.
+        guard let app = blockList.app(for: bundleID), pending == nil else { return }
+        pending = .removeApp(app.bundleID)
         friction.request(now: clock())
+    }
+
+    /// True if an app with this bundle identifier (any casing) is on the block list.
+    public func isAppBlocked(_ bundleID: String) -> Bool {
+        blockList.app(for: bundleID) != nil
     }
 
     /// Cancel a pending weaken action and reset the timer.
@@ -290,6 +323,9 @@ public final class AppModel: ObservableObject {
             return false
         }
 
+        // Clear any stale message first so a failure reported by the system update below is
+        // what the user sees, not overwritten by a blanket reset afterwards.
+        status = nil
         switch action {
         case .turnOff:
             blockList.isBlocking = false
@@ -306,7 +342,6 @@ public final class AppModel: ObservableObject {
         }
         friction.reset()
         self.pending = nil
-        status = nil
         return true
     }
 
@@ -344,34 +379,38 @@ public final class AppModel: ObservableObject {
         guard let notifier else { return }
 
         for domain in blockList.domains {
-            let newCount = Self.aggregate(fresh, for: domain)
-            guard newCount > Self.aggregate(previous, for: domain) else { continue }
-            let currentTime = clock()
-            if let last = lastNotified[domain], currentTime.timeIntervalSince(last) < notificationInterval {
-                continue
-            }
-            lastNotified[domain] = currentTime
-            await notifier.notifyBlocked(domain: domain, count: newCount)
+            await notifyIfGrew(key: domain, label: domain, notifier: notifier,
+                               before: Self.aggregate(previous, for: domain),
+                               after: Self.aggregate(fresh, for: domain))
         }
-
         for app in blockList.apps {
             let key = BlockedApp.statsKey(for: app.bundleID)
-            let newCount = fresh.counts[key] ?? 0
-            guard newCount > (previous.counts[key] ?? 0) else { continue }
-            let currentTime = clock()
-            if let last = lastNotified[app.bundleID], currentTime.timeIntervalSince(last) < notificationInterval {
-                continue
-            }
-            lastNotified[app.bundleID] = currentTime
             // The notifier's `domain` parameter is just the display label; the app name reads
             // naturally in the banner ("Blocked Discord — 3 times so far").
-            await notifier.notifyBlocked(domain: app.name, count: newCount)
+            await notifyIfGrew(key: key, label: app.name, notifier: notifier,
+                               before: previous.counts[key] ?? 0, after: fresh.counts[key] ?? 0)
         }
     }
 
+    /// Post one banner for `label` if its tally grew, rate-limited per `key`.
+    private func notifyIfGrew(key: String, label: String, notifier: BlockNotifying,
+                              before: Int, after: Int) async {
+        guard after > before else { return }
+        let currentTime = clock()
+        if let last = lastNotified[key], currentTime.timeIntervalSince(last) < notificationInterval {
+            return
+        }
+        lastNotified[key] = currentTime
+        await notifier.notifyBlocked(domain: label, count: after)
+    }
+
+    /// Sum of the tallies for a domain and its subdomains. App tallies live in the same
+    /// dictionary under `BlockedApp.statsKeyPrefix` and are skipped — a bundle id such as
+    /// `com.example.app` must never fold into the site `example.app` by suffix.
     private static func aggregate(_ stats: BlockStats, for domain: String) -> Int {
         stats.counts.reduce(0) { sum, entry in
-            entry.key == domain || entry.key.hasSuffix("." + domain) ? sum + entry.value : sum
+            guard !entry.key.hasPrefix(BlockedApp.statsKeyPrefix) else { return sum }
+            return entry.key == domain || entry.key.hasSuffix("." + domain) ? sum + entry.value : sum
         }
     }
 
@@ -403,39 +442,52 @@ public final class AppModel: ObservableObject {
         catch { status = "Couldn't save your list: \(error.localizedDescription)" }
     }
 
-    private func pushToSystem() async {
-        do {
-            let expected = blockList.allBlockedHosts()
-            try await hosts.apply(expected)
-            if let appBlocker { try await appBlocker.applyBlockedApps(blockList.blockedBundleIDs()) }
-            // Verify the write actually landed. `apply` returning without throwing does NOT prove
-            // the privileged helper ran (an unapproved helper never starts, yet the XPC layer can
-            // still resolve) — so read the live managed region back and require it to be EXACTLY
-            // what we asked for. Equality (not subset) matters for removals: a failed write that
-            // left the old, larger region live must not pass as "the removal landed".
-            let live = try await hosts.currentManagedHosts()
-            let hostsOK = Set(expected) == Set(live)
-            let appsOK = await appsVerified()
-            if hostsOK && appsOK {
-                systemBlockVerified = true
-                status = nil
-            } else {
-                systemBlockVerified = false
-                status = "Blocking isn't active — approve SiteBlock's helper in Login Items, then Retry."
-            }
-        } catch {
+    /// Enforce the current intent in the system: the hosts half and/or the app half, each
+    /// attempted independently so a failure in one never leaves the other unapplied. Then verify
+    /// BOTH by reading the live state back — `apply` returning without throwing does NOT prove
+    /// the privileged helper ran (an unapproved helper never starts, yet the XPC layer can still
+    /// resolve), so we require the live hosts region and the live app set to be EXACTLY what we
+    /// asked for. Equality (not subset) matters for removals: a failed write that left the old,
+    /// larger set live must not pass as "the removal landed".
+    private func pushToSystem(hosts pushHosts: Bool = true, apps pushApps: Bool = true) async {
+        var failure: String?
+        if pushHosts {
+            do { try await hosts.apply(blockList.allBlockedHosts()) }
+            catch { failure = error.localizedDescription }
+        }
+        if pushApps, let appBlocker {
+            do { try await appBlocker.applyBlockedApps(blockList.blockedBundleIDs()) }
+            catch { failure = failure ?? error.localizedDescription }
+        }
+        if let failure {
             systemBlockVerified = false
-            status = "Blocking isn't active — \(error.localizedDescription)"
+            status = "Blocking isn't active — \(failure)"
+            return
+        }
+        // Read back. Once the hosts half has failed the verdict is decided; skip the extra round trip.
+        let hostsOK = await hostsVerified()
+        let appsOK = hostsOK ? await appsVerified() : false
+        if hostsOK && appsOK {
+            systemBlockVerified = true
+            status = nil
+        } else {
+            systemBlockVerified = false
+            status = "Blocking isn't active — approve SiteBlock's helper in Login Items, then Retry."
         }
     }
 
+    /// Clear both halves in the system. Each is attempted independently: a failed hosts removal
+    /// must never leave the helper still killing apps (or vice versa) — that would be a partial
+    /// weaken the user cannot see or retry.
     private func removeFromSystem() async {
-        do {
-            try await hosts.removeBlock()
-            if let appBlocker { try await appBlocker.applyBlockedApps([]) }
-            systemBlockVerified = false
-        } catch {
-            status = "Couldn't update blocking: \(error.localizedDescription)"
+        var failure: String?
+        do { try await hosts.removeBlock() }
+        catch { failure = error.localizedDescription }
+        if let appBlocker {
+            do { try await appBlocker.applyBlockedApps([]) }
+            catch { failure = failure ?? error.localizedDescription }
         }
+        systemBlockVerified = false
+        if let failure { status = "Couldn't update blocking: \(failure)" }
     }
 }

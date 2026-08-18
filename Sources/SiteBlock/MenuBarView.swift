@@ -9,6 +9,8 @@ struct MenuBarView: View {
     @ObservedObject var model: AppModel
     @State private var newDomain: String = ""
     @State private var installedApps: [InstalledApp] = []
+    /// Resolved icons for the blocked apps, keyed by bundle id — filled off-main, never in `body`.
+    @State private var appIcons: [String: NSImage] = [:]
 
     private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -84,8 +86,8 @@ struct MenuBarView: View {
             Label("Blocking isn’t active", systemImage: "exclamationmark.triangle.fill")
                 .font(.caption.bold())
                 .foregroundStyle(.orange)
-            Text("The privileged helper isn’t approved, so no sites are actually being blocked. "
-                 + "Approve SiteBlock under “Allow in the Background,” then Retry.")
+            Text("SiteBlock couldn’t confirm the block is enforced (usually the privileged helper "
+                 + "isn’t approved). Approve SiteBlock under “Allow in the Background,” then Retry.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             HStack {
@@ -157,39 +159,19 @@ struct MenuBarView: View {
         }
     }
 
-    @ViewBuilder
     private func domainRow(_ domain: String) -> some View {
-        if model.pending == .removeDomain(domain) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text(domain).font(.body.monospaced())
-                pendingControls(label: "Removing \(domain)")
-            }
-            .padding(6)
-            .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
-        } else {
-            HStack {
-                Text(domain).font(.body.monospaced())
-                Spacer()
-                if model.blockedCount(for: domain) > 0 {
-                    Text("\(model.blockedCount(for: domain))×")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .help("Blocked attempts")
-                }
-                Button {
-                    model.tick()
-                    model.requestRemove(domain)
-                } label: {
-                    Image(systemName: "trash")
-                }
-                .buttonStyle(.borderless)
-                .help("Remove (requires the 5-minute wait)")
-                .disabled(model.pending != nil)
-            }
+        removableRow(isPending: model.pending == .removeDomain(domain),
+                     pendingLabel: "Removing \(domain)",
+                     count: model.blockedCount(for: domain),
+                     countHelp: "Blocked attempts",
+                     onRemove: { model.requestRemove(domain) }) {
+            Text(domain).font(.body.monospaced())
         }
     }
 
     /// Blocked apps: an "Add app…" menu (instant) and the list with the same gated remove flow.
+    /// App discovery and icon resolution hit the filesystem and Launch Services, so both run off
+    /// the main thread once (per popover open / per list change) rather than in `body`.
     private var appSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             Menu {
@@ -198,13 +180,15 @@ struct MenuBarView: View {
                 } else {
                     ForEach(installedApps) { app in
                         Button(app.name) { Task { await model.addApp(bundleID: app.bundleID, name: app.name) } }
-                            .disabled(model.apps.contains { $0.bundleID.lowercased() == app.id })
+                            .disabled(model.isAppBlocked(app.bundleID))
                     }
                 }
             } label: {
                 Label("Add app…", systemImage: "app.badge")
             }
-            .onAppear { installedApps = InstalledApps.discover() }
+            .task {
+                installedApps = await Task.detached(priority: .userInitiated) { InstalledApps.discover() }.value
+            }
 
             if !model.apps.isEmpty {
                 ScrollView {
@@ -217,37 +201,20 @@ struct MenuBarView: View {
                 .frame(maxHeight: 140)
             }
         }
+        .task(id: model.apps.map(\.bundleID)) {
+            let ids = model.apps.map(\.bundleID)
+            let paths = await Task.detached(priority: .utility) { InstalledApps.paths(forBundleIDs: ids) }.value
+            appIcons = InstalledApps.icons(forPaths: paths)
+        }
     }
 
-    @ViewBuilder
     private func appRow(_ app: BlockedApp) -> some View {
-        if model.pending == .removeApp(app.bundleID) {
-            VStack(alignment: .leading, spacing: 6) {
-                appLabel(app)
-                pendingControls(label: "Removing \(app.name)")
-            }
-            .padding(6)
-            .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
-        } else {
-            HStack {
-                appLabel(app)
-                Spacer()
-                if model.blockedCount(forApp: app.bundleID) > 0 {
-                    Text("\(model.blockedCount(forApp: app.bundleID))×")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .help("Blocked launches")
-                }
-                Button {
-                    model.tick()
-                    model.requestRemoveApp(app.bundleID)
-                } label: {
-                    Image(systemName: "trash")
-                }
-                .buttonStyle(.borderless)
-                .help("Remove (requires the 5-minute wait)")
-                .disabled(model.pending != nil)
-            }
+        removableRow(isPending: model.pending == .removeApp(app.bundleID),
+                     pendingLabel: "Removing \(app.name)",
+                     count: model.blockedCount(forApp: app.bundleID),
+                     countHelp: "Blocked launches",
+                     onRemove: { model.requestRemoveApp(app.bundleID) }) {
+            appLabel(app)
         }
     }
 
@@ -255,12 +222,52 @@ struct MenuBarView: View {
     /// installed, so a stale entry stays removable rather than rendering blank.
     private func appLabel(_ app: BlockedApp) -> some View {
         HStack(spacing: 6) {
-            if let icon = InstalledApps.icon(forBundleID: app.bundleID) {
+            if let icon = appIcons[app.bundleID] {
                 Image(nsImage: icon).resizable().frame(width: 16, height: 16)
             } else {
                 Image(systemName: "app.dashed")
             }
             Text(app.name)
+        }
+    }
+
+    /// One list row for anything removable through the friction gate (a domain or an app): the
+    /// label, the blocked tally, and a trash button — or, while this row's removal is pending,
+    /// the shared countdown/confirm controls.
+    @ViewBuilder
+    private func removableRow<Content: View>(isPending: Bool,
+                                           pendingLabel: String,
+                                           count: Int,
+                                           countHelp: String,
+                                           onRemove: @escaping () -> Void,
+                                           @ViewBuilder label: () -> Content) -> some View {
+        if isPending {
+            VStack(alignment: .leading, spacing: 6) {
+                label()
+                pendingControls(label: pendingLabel)
+            }
+            .padding(6)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+        } else {
+            HStack {
+                label()
+                Spacer()
+                if count > 0 {
+                    Text("\(count)×")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .help(countHelp)
+                }
+                Button {
+                    model.tick()
+                    onRemove()
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .help("Remove (requires the 5-minute wait)")
+                .disabled(model.pending != nil)
+            }
         }
     }
 

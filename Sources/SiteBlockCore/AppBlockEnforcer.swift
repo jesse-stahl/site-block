@@ -28,14 +28,16 @@ public protocol ProcessSignaling {
 /// Each `sweep` maps every process → outermost bundle root (`AppBundle.bundleRoot`) → bundle id
 /// (cached per root; a plist read per process per second would be wasteful) and, for ids in the
 /// blocked set: SIGTERM on first sight, SIGKILL once `forceKillAfter` has elapsed and it is still
-/// alive. Matching is case-insensitive. The helper's own pid and `protectedBundleIDs` (SiteBlock
-/// itself) are never signalled, so a mis-click can't lock the user out.
+/// alive. Matching is case-insensitive. The helper's own pid, `AppBlockPolicy.neverBlock` and any
+/// extra `protectedBundleIDs` are never signalled, so neither a mis-click nor a hand-edited list
+/// can lock the user out.
 ///
 /// Attempt reporting: `sweep` returns the blocked bundle ids (deduplicated) of processes seen for
 /// the FIRST time since the set was applied. `setBlockedBundleIDs` performs an immediate baseline
 /// sweep that kills already-running matches silently — turning blocking on while Discord is open
-/// is housekeeping, not a "blocked attempt". Not thread-safe: the owner must call it from one
-/// serial queue.
+/// is housekeeping, not a "blocked attempt". Re-applying an identical set is a no-op, so routine
+/// re-pushes from the app never reset the escalation clock or swallow an in-flight attempt.
+/// Not thread-safe: the owner must call it from one serial queue.
 public final class AppBlockEnforcer {
 
     private let processes: ProcessListing
@@ -45,14 +47,17 @@ public final class AppBlockEnforcer {
     private let protected: Set<String>
     private let ownPID: Int32
 
-    /// Exactly what was last applied (original casing), for verification round-trips.
+    /// Exactly what was last applied (original casing, original order), for verification
+    /// round-trips.
     public private(set) var blockedBundleIDs: [String] = []
-    /// Lowercased for matching.
-    private var blockedLowercased: Set<String> = []
+    /// Lowercased id → the user's original casing, for matching and for reporting attempts.
+    private var blocked: [String: String] = [:]
     /// pid → time SIGTERM was sent. A pid absent here has not been signalled yet.
     private var termSentAt: [Int32: Date] = [:]
-    /// Bundle root → resolved id (nil cached too, so unknown bundles aren't re-read every second).
-    private var idCache: [String: String?] = [:]
+    /// Bundle root → resolved id. Only successful lookups are cached: a transiently unreadable
+    /// Info.plist (an app mid-self-update) must be retried next sweep, not remembered as "unknown"
+    /// for the lifetime of the root daemon.
+    private var idCache: [String: String] = [:]
 
     public init(processes: ProcessListing,
                 signals: ProcessSignaling,
@@ -64,16 +69,21 @@ public final class AppBlockEnforcer {
         self.signals = signals
         self.bundleIdentifier = bundleIdentifier
         self.forceKillAfter = forceKillAfter
-        self.protected = Set(protectedBundleIDs.map { $0.lowercased() })
+        self.protected = AppBlockPolicy.neverBlock.union(protectedBundleIDs.map { $0.lowercased() })
         self.ownPID = ownPID
     }
 
     /// Replace the blocked set and immediately kill any running matches (silently — no attempts).
-    public func setBlockedBundleIDs(_ ids: [String], now: Date) {
+    /// Returns `false` (and does nothing) if `ids` is exactly what is already applied.
+    @discardableResult
+    public func setBlockedBundleIDs(_ ids: [String], now: Date) -> Bool {
+        guard ids != blockedBundleIDs else { return false }
         blockedBundleIDs = ids
-        blockedLowercased = Set(ids.map { $0.lowercased() })
+        blocked = Dictionary(ids.map { ($0.lowercased(), $0) }, uniquingKeysWith: { first, _ in first })
         termSentAt = [:]
+        idCache = [:]   // an app updated in place may have a new id at the same root
         _ = run(now: now, countAttempts: false)
+        return true
     }
 
     /// One enforcement pass. Returns the blocked bundle ids of NEWLY seen matching processes.
@@ -83,15 +93,15 @@ public final class AppBlockEnforcer {
     }
 
     private func run(now: Date, countAttempts: Bool) -> [String] {
-        guard !blockedLowercased.isEmpty else { return [] }
+        guard !blocked.isEmpty else { return [] }
         var alive = Set<Int32>()
         var attempts: [String] = []
         var reported = Set<String>()
 
         for process in processes.runningProcesses() where process.pid != ownPID {
-            guard let root = AppBundle.bundleRoot(forExecutable: process.executablePath) else { continue }
-            guard let id = cachedIdentifier(root)?.lowercased(),
-                  blockedLowercased.contains(id), !protected.contains(id) else { continue }
+            guard let root = AppBundle.bundleRoot(forExecutable: process.executablePath),
+                  let id = cachedIdentifier(root)?.lowercased(),
+                  let original = blocked[id], !protected.contains(id) else { continue }
             alive.insert(process.pid)
 
             if let sentAt = termSentAt[process.pid] {
@@ -101,10 +111,9 @@ public final class AppBlockEnforcer {
             } else {
                 termSentAt[process.pid] = now
                 signals.terminate(pid: process.pid)
-                if countAttempts, !reported.contains(id) {
-                    reported.insert(id)
+                if countAttempts, reported.insert(id).inserted {
                     // Report with the user's original casing so stats/notifications look right.
-                    attempts.append(blockedBundleIDs.first { $0.lowercased() == id } ?? id)
+                    attempts.append(original)
                 }
             }
         }
@@ -115,34 +124,26 @@ public final class AppBlockEnforcer {
 
     private func cachedIdentifier(_ root: String) -> String? {
         if let cached = idCache[root] { return cached }
-        let resolved = bundleIdentifier(root)
+        guard let resolved = bundleIdentifier(root) else { return nil }
         idCache[root] = resolved
         return resolved
     }
 }
 
-/// JSON persistence for the helper's blocked-app set, mirroring `BlockStatsStore` (atomic write,
-/// empty on missing file). Lives root-owned next to the stats file so app blocking survives a
-/// reboot even if the menu bar app never launches — the same "the block outlives the UI" guarantee
-/// `/etc/hosts` gives sites.
+/// JSON persistence for the helper's blocked-app set. Lives root-owned next to the stats file so
+/// app blocking survives a reboot even if the menu bar app never launches — the same "the block
+/// outlives the UI" guarantee `/etc/hosts` gives sites.
 public struct BlockedAppsStore {
 
-    public let url: URL
+    private let store: JSONFileStore<[String]>
+    public var url: URL { store.url }
 
     public init(url: URL) {
-        self.url = url
+        store = JSONFileStore(url: url, empty: { [] })
     }
 
-    public func load() throws -> [String] {
-        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
-        return try JSONDecoder().decode([String].self, from: Data(contentsOf: url))
-    }
+    /// Empty if nothing has been saved yet.
+    public func load() throws -> [String] { try store.load() }
 
-    public func save(_ bundleIDs: [String]) throws {
-        let dir = url.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(bundleIDs).write(to: url, options: .atomic)
-    }
+    public func save(_ bundleIDs: [String]) throws { try store.save(bundleIDs) }
 }

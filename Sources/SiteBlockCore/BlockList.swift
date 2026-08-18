@@ -69,13 +69,15 @@ public struct BlockList: Codable, Equatable {
 
     // MARK: apps
 
-    /// Add an app by bundle identifier. Trims whitespace; rejects empty ids/names and duplicates
-    /// (bundle ids compare case-insensitively). Returns `true` if added. Strengthen — instant.
+    /// Add an app by bundle identifier. Trims whitespace; rejects empty ids/names, duplicates
+    /// (bundle ids compare case-insensitively) and apps `AppBlockPolicy` says must never be
+    /// blocked. Returns `true` if added. Strengthen — instant.
     @discardableResult
     public mutating func addApp(bundleID: String, name: String) -> Bool {
         let id = bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
         let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !id.isEmpty, !displayName.isEmpty, indexOfApp(id) == nil else { return false }
+        guard !id.isEmpty, !displayName.isEmpty, AppBlockPolicy.isBlockable(id),
+              indexOfApp(id) == nil else { return false }
         apps.append(BlockedApp(bundleID: id, name: displayName))
         return true
     }
@@ -94,9 +96,15 @@ public struct BlockList: Codable, Equatable {
         apps.map(\.bundleID)
     }
 
+    /// The blocked app matching `bundleID` (case-insensitive), or nil if it isn't on the list.
+    /// The returned entry carries the CANONICAL id as stored, so callers can key on it.
+    public func app(for bundleID: String) -> BlockedApp? {
+        indexOfApp(bundleID).map { apps[$0] }
+    }
+
     /// Display name for a blocked app, or nil if it isn't on the list.
     public func appName(for bundleID: String) -> String? {
-        indexOfApp(bundleID).map { apps[$0].name }
+        app(for: bundleID)?.name
     }
 
     private func indexOfApp(_ bundleID: String) -> Int? {
@@ -108,10 +116,11 @@ public struct BlockList: Codable, Equatable {
 /// Loads and saves a `BlockList` as JSON. The file URL is injectable for testing.
 public struct BlockListStore {
 
-    public let url: URL
+    private let store: JSONFileStore<BlockList>
+    public var url: URL { store.url }
 
     public init(url: URL) {
-        self.url = url
+        store = JSONFileStore(url: url, empty: { BlockList() })
     }
 
     /// The default on-disk location: `~/Library/Application Support/SiteBlock/blocklist.json`.
@@ -124,18 +133,8 @@ public struct BlockListStore {
 
     /// Load the persisted list. Returns an empty default if the file does not exist yet.
     /// Throws only if the file exists but cannot be decoded.
-    public func load() throws -> BlockList {
-        guard FileManager.default.fileExists(atPath: url.path) else { return BlockList() }
-        let data = try Data(contentsOf: url)
-        return try JSONDecoder().decode(BlockList.self, from: data)
-    }
+    public func load() throws -> BlockList { try store.load() }
 
     /// Persist the list, creating the containing directory if needed. Written atomically.
-    public func save(_ list: BlockList) throws {
-        let dir = url.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(list).write(to: url, options: .atomic)
-    }
+    public func save(_ list: BlockList) throws { try store.save(list) }
 }

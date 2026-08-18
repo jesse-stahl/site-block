@@ -26,6 +26,19 @@ final class AppBundleTests: XCTestCase {
                      "a root of empty string is not a bundle")
     }
 
+    func testBundleRootIsNilForToolsShippedInsideABundle() {
+        // Blocking Xcode must not kill every `git`/`clang` other apps run from its toolchain.
+        XCTAssertNil(AppBundle.bundleRoot(forExecutable: "/Applications/Xcode.app/Contents/Developer/usr/bin/git"))
+        XCTAssertNil(AppBundle.bundleRoot(forExecutable:
+            "/Applications/Xcode.app/Contents/SharedFrameworks/LLDB.framework/Versions/A/Resources/lldb-rpc-server"))
+        // …while Xcode itself and the apps nested under it are still the app.
+        XCTAssertEqual(AppBundle.bundleRoot(forExecutable: "/Applications/Xcode.app/Contents/MacOS/Xcode"),
+                       "/Applications/Xcode.app")
+        XCTAssertEqual(AppBundle.bundleRoot(forExecutable:
+            "/Applications/Xcode.app/Contents/Developer/Applications/Simulator.app/Contents/MacOS/Simulator"),
+            "/Applications/Xcode.app")
+    }
+
     func testBundleIdentifierReadsInfoPlist() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("siteblock-\(UUID().uuidString)/Fake.app")
