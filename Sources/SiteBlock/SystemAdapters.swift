@@ -6,7 +6,7 @@ import SiteBlockCore
 
 /// Talks to the privileged helper over XPC to apply/remove the system block. Conforms to
 /// `HostsApplying` so `AppModel` is agnostic about how blocking reaches `/etc/hosts`.
-final class HelperClient: HostsApplying, BlockStatsProviding, @unchecked Sendable {
+final class HelperClient: HostsApplying, AppBlockApplying, BlockStatsProviding, @unchecked Sendable {
 
     enum HelperClientError: LocalizedError {
         case failed(String)
@@ -55,6 +55,29 @@ final class HelperClient: HostsApplying, BlockStatsProviding, @unchecked Sendabl
             }
             control.currentManagedHosts { hosts in
                 if resumed.claim() { continuation.resume(returning: hosts) }
+            }
+        }
+    }
+
+    /// Apply the blocked-app set to the helper, which is the only component that can see and
+    /// terminate processes owned by other users' sessions.
+    func applyBlockedApps(_ bundleIDs: [String]) async throws {
+        try await call { proxy, reply in proxy.applyBlockedApps(bundleIDs: bundleIDs, withReply: reply) }
+    }
+
+    /// Read the app set the helper is enforcing, so `AppModel` can verify an apply landed.
+    func currentBlockedApps() async throws -> [String] {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[String], Error>) in
+            let resumed = ResumeGuard()
+            let proxy = connection.remoteObjectProxyWithErrorHandler { error in
+                if resumed.claim() { continuation.resume(throwing: error) }
+            }
+            guard let control = proxy as? HostsControlProtocol else {
+                if resumed.claim() { continuation.resume(throwing: HelperClientError.failed("Helper unavailable")) }
+                return
+            }
+            control.currentBlockedApps { ids in
+                if resumed.claim() { continuation.resume(returning: ids) }
             }
         }
     }
@@ -157,7 +180,7 @@ final class BlockNotificationBanner: BlockNotifying, @unchecked Sendable {
         let content = UNMutableNotificationContent()
         content.title = "SiteBlock kept you focused"
         content.body = count == 1
-            ? "Blocked your first visit to \(domain)."
+            ? "Blocked \(domain) for the first time."
             : "Blocked \(domain) — \(count) times so far."
         content.sound = nil // visible but not noisy
         let request = UNNotificationRequest(identifier: "siteblock.hit.\(domain)",

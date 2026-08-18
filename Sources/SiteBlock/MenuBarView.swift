@@ -2,12 +2,13 @@ import SwiftUI
 import ServiceManagement
 import SiteBlockCore
 
-/// The menu bar popover: master toggle, add-domain field, and the domain list — with the gated
-/// countdown/confirm UI surfacing whenever a weaken action is pending.
+/// The menu bar popover: master toggle, add-domain field, the domain list, and the blocked-app
+/// list — with the gated countdown/confirm UI surfacing whenever a weaken action is pending.
 struct MenuBarView: View {
 
     @ObservedObject var model: AppModel
     @State private var newDomain: String = ""
+    @State private var installedApps: [InstalledApp] = []
 
     private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -21,6 +22,7 @@ struct MenuBarView: View {
             masterToggle
             addField
             domainList
+            appSection
             if let status = model.status {
                 Text(status).font(.caption).foregroundStyle(.secondary)
             }
@@ -187,6 +189,81 @@ struct MenuBarView: View {
         }
     }
 
+    /// Blocked apps: an "Add app…" menu (instant) and the list with the same gated remove flow.
+    private var appSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Menu {
+                if installedApps.isEmpty {
+                    Text("No apps found")
+                } else {
+                    ForEach(installedApps) { app in
+                        Button(app.name) { Task { await model.addApp(bundleID: app.bundleID, name: app.name) } }
+                            .disabled(model.apps.contains { $0.bundleID.lowercased() == app.id })
+                    }
+                }
+            } label: {
+                Label("Add app…", systemImage: "app.badge")
+            }
+            .onAppear { installedApps = InstalledApps.discover() }
+
+            if !model.apps.isEmpty {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(model.apps, id: \.bundleID) { app in
+                            appRow(app)
+                        }
+                    }
+                }
+                .frame(maxHeight: 140)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func appRow(_ app: BlockedApp) -> some View {
+        if model.pending == .removeApp(app.bundleID) {
+            VStack(alignment: .leading, spacing: 6) {
+                appLabel(app)
+                pendingControls(label: "Removing \(app.name)")
+            }
+            .padding(6)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+        } else {
+            HStack {
+                appLabel(app)
+                Spacer()
+                if model.blockedCount(forApp: app.bundleID) > 0 {
+                    Text("\(model.blockedCount(forApp: app.bundleID))×")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .help("Blocked launches")
+                }
+                Button {
+                    model.tick()
+                    model.requestRemoveApp(app.bundleID)
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .help("Remove (requires the 5-minute wait)")
+                .disabled(model.pending != nil)
+            }
+        }
+    }
+
+    /// Icon + name for a blocked app; falls back to a placeholder glyph when the app is no longer
+    /// installed, so a stale entry stays removable rather than rendering blank.
+    private func appLabel(_ app: BlockedApp) -> some View {
+        HStack(spacing: 6) {
+            if let icon = InstalledApps.icon(forBundleID: app.bundleID) {
+                Image(nsImage: icon).resizable().frame(width: 16, height: 16)
+            } else {
+                Image(systemName: "app.dashed")
+            }
+            Text(app.name)
+        }
+    }
+
     /// The shared cooldown → confirm UI used by both turn-off and remove.
     @ViewBuilder
     private func pendingControls(label: String) -> some View {
@@ -218,7 +295,7 @@ struct MenuBarView: View {
         HStack {
             Text(model.blockStats.total > 0
                  ? "\(model.blockStats.total) attempts blocked so far."
-                 : "Blocks across all browsers.")
+                 : "Blocks sites in every browser, and apps.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             Spacer()

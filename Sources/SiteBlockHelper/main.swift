@@ -7,6 +7,7 @@ import SiteBlockCore
 ///
 /// This is deliberately thin — every hosts transformation is done by the well-tested
 /// `SiteBlockCore.HostsFile`, keeping the privileged code minimal and auditable.
+/// It also keeps blocked apps from running (see `ProcessWatcher`).
 final class HostsControlService: NSObject, HostsControlProtocol {
 
     private let writer = HostsFileWriter.system
@@ -16,6 +17,9 @@ final class HostsControlService: NSObject, HostsControlProtocol {
     /// Root-owned stats file — the helper is the only writer; the app reads via XPC.
     private let statsStore = BlockStatsStore(
         url: URL(fileURLWithPath: "/Library/Application Support/SiteBlock/blockstats.json"))
+    /// Kills blocked apps; its set is persisted root-owned next to the stats file.
+    private let processWatcher = ProcessWatcher(
+        store: BlockedAppsStore(url: URL(fileURLWithPath: "/Library/Application Support/SiteBlock/blockedapps.json")))
 
     /// In-memory copy of the managed host set, so per-hit filtering never touches the disk —
     /// browsers fire many connection attempts per visit and hits arrive on the blocked-page and
@@ -37,6 +41,15 @@ final class HostsControlService: NSObject, HostsControlProtocol {
         try? tlsSensor.start(port: 443)
         blockedPage.onHit = { [weak self] host in self?.recordAttempt(host) }
         tlsSensor.onClientHello = { [weak self] host in self?.recordAttempt(host) }
+
+        // Blocked-app launches count as attempts under their namespaced key, so the app can show
+        // per-app tallies and the "kept you focused" banner just like for sites.
+        processWatcher.onAttempt = { [weak self] bundleID in
+            guard let self else { return }
+            if recorder.recordHit(host: BlockedApp.statsKey(for: bundleID)) {
+                try? statsStore.save(recorder.stats)
+            }
+        }
     }
 
     /// Count an observed access attempt — but only for hosts we are actually blocking right now,
@@ -88,6 +101,15 @@ final class HostsControlService: NSObject, HostsControlProtocol {
 
     func blockStats(withReply reply: @escaping (Data?) -> Void) {
         reply(try? JSONEncoder().encode(recorder.stats))
+    }
+
+    func applyBlockedApps(bundleIDs: [String], withReply reply: @escaping (Bool, String?) -> Void) {
+        processWatcher.setBlockedApps(bundleIDs)
+        reply(true, nil)
+    }
+
+    func currentBlockedApps(withReply reply: @escaping ([String]) -> Void) {
+        reply(processWatcher.currentBlockedApps())
     }
 }
 

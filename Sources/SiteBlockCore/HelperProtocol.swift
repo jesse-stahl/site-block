@@ -27,4 +27,11 @@ public enum HelperInfo {
     /// The running block-attempt tallies as JSON-encoded `BlockStats` (a Data blob keeps the XPC
     /// surface to plist-safe types). Nil if encoding fails.
     func blockStats(withReply reply: @escaping (_ statsJSON: Data?) -> Void)
+
+    /// Set the apps (bundle identifiers) the helper must keep from running while blocking is on.
+    /// An empty array clears app blocking. Already-running matches are quit immediately.
+    func applyBlockedApps(bundleIDs: [String], withReply reply: @escaping (_ ok: Bool, _ error: String?) -> Void)
+
+    /// The bundle identifiers currently being enforced (for verification/reconciliation).
+    func currentBlockedApps(withReply reply: @escaping (_ bundleIDs: [String]) -> Void)
 }
