@@ -85,26 +85,17 @@ public final class BlockEventRecorder: @unchecked Sendable {
 /// missing file).
 public struct BlockStatsStore {
 
-    public let url: URL
+    private let store: JSONFileStore<BlockStats>
+    public var url: URL { store.url }
 
     public init(url: URL) {
-        self.url = url
+        store = JSONFileStore(url: url, empty: { BlockStats() })
     }
 
     /// Load the persisted stats. Returns an empty default if the file does not exist yet.
     /// Throws only if the file exists but cannot be decoded.
-    public func load() throws -> BlockStats {
-        guard FileManager.default.fileExists(atPath: url.path) else { return BlockStats() }
-        let data = try Data(contentsOf: url)
-        return try JSONDecoder().decode(BlockStats.self, from: data)
-    }
+    public func load() throws -> BlockStats { try store.load() }
 
     /// Persist the stats, creating the containing directory if needed. Written atomically.
-    public func save(_ stats: BlockStats) throws {
-        let dir = url.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(stats).write(to: url, options: .atomic)
-    }
+    public func save(_ stats: BlockStats) throws { try store.save(stats) }
 }

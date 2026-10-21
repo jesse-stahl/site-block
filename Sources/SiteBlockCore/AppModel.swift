@@ -13,6 +13,15 @@ public protocol HostsApplying {
     func currentManagedHosts() async throws -> [String]
 }
 
+/// Applies the blocked-app set to the system (via the privileged helper in production, a fake in
+/// tests). Mirrors `HostsApplying`: an apply must be verified by reading the live set back.
+public protocol AppBlockApplying {
+    /// Enforce exactly these bundle identifiers (empty clears app blocking).
+    func applyBlockedApps(_ bundleIDs: [String]) async throws
+    /// The bundle identifiers the helper is enforcing right now.
+    func currentBlockedApps() async throws -> [String]
+}
+
 /// Presents the secure Mac-password prompt used to confirm a weaken action.
 public protocol PasswordAuthenticating {
     /// Returns `true` if the user successfully authenticated.
@@ -36,9 +45,13 @@ public protocol BlockNotifying {
 /// The observable app state and all of SiteBlock's action logic, independent of SwiftUI so it can
 /// be unit-tested. Enforces the asymmetric friction model:
 ///
-/// - **Strengthen** (turn ON, add a domain) — applied immediately, no gate.
-/// - **Weaken** (turn OFF, remove a domain) — routed through `FrictionMachine`: a 5-minute
-///   cooldown, then a 2-minute confirmation window, then a Mac-password prompt.
+/// - **Strengthen** (turn ON, add or resume a domain/app) — applied immediately, no gate.
+/// - **Weaken** (turn OFF, remove a domain/app) — routed through `FrictionMachine`: a cooldown
+///   (5 min or longer, per `FrictionSettings`), then a confirmation window (2 min or longer), then
+///   a Mac-password prompt.
+/// - **Off-only** (pause a domain/app, change the gate lengths) — free, but only while blocking is
+///   off, where there is nothing live to weaken. With blocking on they're unavailable: the way
+///   there is turning blocking off, which pays the gate.
 ///
 /// Time comes from an injected `clock` closure (defaults to `Date()`), so the view can drive a
 /// real display timer while tests drive it deterministically. Critically, the confirmation window
@@ -52,6 +65,8 @@ public final class AppModel: ObservableObject {
     public enum PendingWeaken: Equatable {
         case turnOff
         case removeDomain(String)
+        /// Remove an app, identified by bundle identifier.
+        case removeApp(String)
     }
 
     /// How enforcement in the *system* stands relative to the user's intent.
@@ -80,10 +95,14 @@ public final class AppModel: ObservableObject {
     private let store: BlockListStore
     private let hosts: HostsApplying
     private let auth: PasswordAuthenticating
+    /// Optional because app blocking is a later addition: when nil the model enforces hosts only,
+    /// so every pre-existing caller behaves exactly as it did before.
+    private let appBlocker: AppBlockApplying?
     private let statsProvider: BlockStatsProviding?
     private let notifier: BlockNotifying?
     private let clock: () -> Date
-    /// Per-domain time of the last posted notification, for rate-limiting.
+    /// Time of the last posted notification per target, for rate-limiting. Keyed by the domain
+    /// for sites and by `BlockedApp.statsKey` for apps, so the two namespaces can't collide.
     private var lastNotified: [String: Date] = [:]
     /// Minimum gap between notifications for the same domain — a blocked page reload spree
     /// shouldn't buzz the user every few seconds.
@@ -92,25 +111,39 @@ public final class AppModel: ObservableObject {
     public init(store: BlockListStore,
                 hosts: HostsApplying,
                 auth: PasswordAuthenticating,
+                apps: AppBlockApplying? = nil,
                 statsProvider: BlockStatsProviding? = nil,
                 notifier: BlockNotifying? = nil,
-                friction: FrictionMachine = FrictionMachine(),
                 notificationInterval: TimeInterval = 60,
                 clock: @escaping () -> Date = { Date() }) {
         self.store = store
         self.hosts = hosts
         self.auth = auth
+        self.appBlocker = apps
         self.statsProvider = statsProvider
         self.notifier = notifier
-        self.friction = friction
         self.notificationInterval = notificationInterval
         self.clock = clock
         self.now = clock()
-        self.blockList = (try? store.load()) ?? BlockList()
+        let loaded = (try? store.load()) ?? BlockList()
+        self.blockList = loaded
+        self.friction = Self.machine(for: loaded.settings)
     }
 
     public var isBlocking: Bool { blockList.isBlocking }
     public var domains: [String] { blockList.domains }
+    public var apps: [BlockedApp] { blockList.apps }
+    public var settings: FrictionSettings { blockList.settings }
+
+    public func isDomainPaused(_ domain: String) -> Bool { blockList.isDomainPaused(domain) }
+    public func isAppPaused(_ bundleID: String) -> Bool { blockList.isAppPaused(bundleID) }
+
+    /// Pausing an item and changing the gate lengths are only possible while blocking is off.
+    public var canPause: Bool { !blockList.isBlocking }
+
+    /// …and the gate lengths also not while a weaken action is mid-countdown, so a running timer
+    /// is never shortened (or silently restarted) underneath the user.
+    public var canChangeSettings: Bool { !blockList.isBlocking && pending == nil }
 
     /// The truthful blocking state for the UI: distinguishes "on and actually enforced" from
     /// "on but not enforced" (helper unapproved / write failed) so the app can never claim it's
@@ -134,17 +167,50 @@ public final class AppModel: ObservableObject {
     /// keep claiming `.active`. Re-applying is a *strengthen* action, so healing is ungated —
     /// only weakening goes through the friction gate. No-op while blocking is off.
     public func verifyEnforcement() async {
-        guard blockList.isBlocking else { return }
-        let expected = blockList.allBlockedHosts()
+        guard blockList.isBlocking else {
+            // Off is an intent too: a turn-off whose system removal partly failed (helper busy,
+            // XPC drop) must not leave root killing the user's apps behind an "off" padlock.
+            // Only the halves still live are touched, and this path is a weaken the user already
+            // paid the gate for.
+            let hostsLive = await hostsStillLive()
+            let appsLive = await appsStillLive()
+            if hostsLive || appsLive { await removeFromSystem(hosts: hostsLive, apps: appsLive) }
+            return
+        }
         // Unreachable helper → we can no longer vouch for enforcement; pushToSystem below will
-        // set the precise status message.
-        let live = (try? await hosts.currentManagedHosts()) ?? []
-        if Set(expected) == Set(live) {
+        // set the precise status message. BOTH halves must match: a live hosts region with a
+        // stripped app set is not "enforced" — but only the half that drifted is re-applied, so a
+        // stuck app half never causes a privileged /etc/hosts rewrite every 5 seconds.
+        let hostsOK = await hostsVerified()
+        let appsOK = await appsVerified()
+        if hostsOK && appsOK {
             systemBlockVerified = true
             return
         }
         systemBlockVerified = false
-        await pushToSystem()
+        await pushToSystem(hosts: !hostsOK, apps: !appsOK)
+    }
+
+    /// True if the live managed hosts region is exactly ours (unreachable helper → false).
+    private func hostsVerified() async -> Bool {
+        guard let live = try? await hosts.currentManagedHosts() else { return false }
+        return Set(live) == Set(blockList.allBlockedHosts())
+    }
+
+    /// True if the helper's live app set is exactly ours (or app blocking isn't wired up).
+    private func appsVerified() async -> Bool {
+        guard let appBlocker else { return true }
+        guard let live = try? await appBlocker.currentBlockedApps() else { return false }
+        return Set(live) == Set(blockList.blockedBundleIDs())
+    }
+
+    private func hostsStillLive() async -> Bool {
+        !((try? await hosts.currentManagedHosts()) ?? []).isEmpty
+    }
+
+    private func appsStillLive() async -> Bool {
+        guard let appBlocker else { return false }
+        return !((try? await appBlocker.currentBlockedApps()) ?? []).isEmpty
     }
 
     // MARK: - Strengthen actions (instant, ungated)
@@ -156,19 +222,92 @@ public final class AppModel: ObservableObject {
             status = "That doesn't look like a valid domain."
             return
         }
-        persist()
         status = nil
+        let saveError = persist()
         if blockList.isBlocking {
-            await pushToSystem()
+            await pushToSystem(apps: false)
         }
+        surface(saveError)
+    }
+
+    /// Add an app by bundle identifier. Instant. Applies to the live system if blocking is on.
+    public func addApp(bundleID: String, name: String) async {
+        guard blockList.addApp(bundleID: bundleID, name: name) else {
+            status = "That app couldn't be added."
+            return
+        }
+        status = nil
+        let saveError = persist()
+        if blockList.isBlocking {
+            await pushToSystem(hosts: false)
+        }
+        surface(saveError)
+    }
+
+    /// Resume a paused domain. A strengthen action — instant, and applied live if blocking is on.
+    public func resumeDomain(_ domain: String) async {
+        guard blockList.setDomainPaused(domain, false) else { return }
+        status = nil
+        let saveError = persist()
+        if blockList.isBlocking { await pushToSystem(apps: false) }
+        surface(saveError)
+    }
+
+    /// Resume a paused app. A strengthen action — instant, and applied live if blocking is on.
+    public func resumeApp(_ bundleID: String) async {
+        guard blockList.setAppPaused(bundleID, false) else { return }
+        status = nil
+        let saveError = persist()
+        if blockList.isBlocking { await pushToSystem(hosts: false) }
+        surface(saveError)
     }
 
     /// Turn blocking on. Instant, no gate.
     public func turnBlockingOn() async {
         guard !blockList.isBlocking else { return }
         blockList.isBlocking = true
-        persist()
+        let saveError = persist()
         await pushToSystem()
+        surface(saveError)
+    }
+
+    // MARK: - Off-only actions (free, but only while blocking is off)
+
+    /// Pause a domain so the next "turn on" leaves it out. No-op while blocking is on.
+    public func pauseDomain(_ domain: String) {
+        guard canPause, blockList.setDomainPaused(domain, true) else { return }
+        persist()
+    }
+
+    /// Pause an app so the next "turn on" leaves it out. No-op while blocking is on.
+    public func pauseApp(_ bundleID: String) {
+        guard canPause, blockList.setAppPaused(bundleID, true) else { return }
+        persist()
+    }
+
+    /// Set the wait before a weaken action can be confirmed (clamped to
+    /// `FrictionSettings.cooldownRange`). No-op unless `canChangeSettings`.
+    public func setCooldownMinutes(_ minutes: Int) {
+        guard canChangeSettings else { return }
+        update(FrictionSettings(cooldownMinutes: minutes, windowMinutes: settings.windowMinutes))
+    }
+
+    /// Set how long the confirmation window stays open (clamped to `FrictionSettings.windowRange`).
+    /// No-op unless `canChangeSettings`.
+    public func setWindowMinutes(_ minutes: Int) {
+        guard canChangeSettings else { return }
+        update(FrictionSettings(cooldownMinutes: settings.cooldownMinutes, windowMinutes: minutes))
+    }
+
+    private func update(_ newSettings: FrictionSettings) {
+        guard newSettings != blockList.settings else { return }
+        blockList.settings = newSettings
+        friction = Self.machine(for: newSettings)
+        persist()
+    }
+
+    private static func machine(for settings: FrictionSettings) -> FrictionMachine {
+        FrictionMachine(cooldown: settings.cooldown, window: settings.window)
     }
 
     // MARK: - Weaken actions (gated: cooldown -> window -> password)
@@ -188,6 +327,21 @@ public final class AppModel: ObservableObject {
         guard blockList.domains.contains(domain), pending == nil else { return }
         pending = .removeDomain(domain)
         friction.request(now: clock())
+    }
+
+    /// Begin removing an app. Starts the friction cooldown. No-op if another weaken action is
+    /// already in flight (see `requestTurnOff`).
+    public func requestRemoveApp(_ bundleID: String) {
+        // Store the canonical id (as listed), so the pending state matches the row regardless of
+        // the casing the caller passed.
+        guard let app = blockList.app(for: bundleID), pending == nil else { return }
+        pending = .removeApp(app.bundleID)
+        friction.request(now: clock())
+    }
+
+    /// True if an app with this bundle identifier (any casing) is on the block list.
+    public func isAppBlocked(_ bundleID: String) -> Bool {
+        blockList.app(for: bundleID) != nil
     }
 
     /// Cancel a pending weaken action and reset the timer.
@@ -220,8 +374,9 @@ public final class AppModel: ObservableObject {
 
         let reason: String
         switch action {
-        case .turnOff: reason = "turn off website blocking"
+        case .turnOff: reason = "turn off blocking"
         case .removeDomain(let d): reason = "remove \(d) from your block list"
+        case .removeApp(let id): reason = "remove \(blockList.appName(for: id) ?? id) from your block list"
         }
         guard await auth.authenticate(reason: reason) else {
             status = "Authentication cancelled."
@@ -243,6 +398,9 @@ public final class AppModel: ObservableObject {
             return false
         }
 
+        // Clear any stale message first so a failure reported by the system update below is
+        // what the user sees, not overwritten by a blanket reset afterwards.
+        status = nil
         switch action {
         case .turnOff:
             blockList.isBlocking = false
@@ -250,12 +408,17 @@ public final class AppModel: ObservableObject {
             await removeFromSystem()
         case .removeDomain(let domain):
             blockList.remove(domain)
-            persist()
-            if blockList.isBlocking { await pushToSystem() }
+            let saveError = persist()
+            if blockList.isBlocking { await pushToSystem(apps: false) }
+            surface(saveError)
+        case .removeApp(let id):
+            blockList.removeApp(bundleID: id)
+            let saveError = persist()
+            if blockList.isBlocking { await pushToSystem(hosts: false) }
+            surface(saveError)
         }
         friction.reset()
         self.pending = nil
-        status = nil
         return true
     }
 
@@ -269,6 +432,12 @@ public final class AppModel: ObservableObject {
     /// (facebook.com + www.facebook.com + m.facebook.com + …).
     public func blockedCount(for domain: String) -> Int {
         Self.aggregate(blockStats, for: domain)
+    }
+
+    /// All-time blocked launch attempts for a blocked app (tallied by the helper under the
+    /// namespaced `app:` key so it can never collide with a domain).
+    public func blockedCount(forApp bundleID: String) -> Int {
+        blockStats.counts[BlockedApp.statsKey(for: bundleID)] ?? 0
     }
 
     /// Fetch the latest tallies from the helper, publish them, and notify the user about domains
@@ -287,20 +456,38 @@ public final class AppModel: ObservableObject {
         guard let notifier else { return }
 
         for domain in blockList.domains {
-            let newCount = Self.aggregate(fresh, for: domain)
-            guard newCount > Self.aggregate(previous, for: domain) else { continue }
-            let currentTime = clock()
-            if let last = lastNotified[domain], currentTime.timeIntervalSince(last) < notificationInterval {
-                continue
-            }
-            lastNotified[domain] = currentTime
-            await notifier.notifyBlocked(domain: domain, count: newCount)
+            await notifyIfGrew(key: domain, label: domain, notifier: notifier,
+                               before: Self.aggregate(previous, for: domain),
+                               after: Self.aggregate(fresh, for: domain))
+        }
+        for app in blockList.apps {
+            let key = BlockedApp.statsKey(for: app.bundleID)
+            // The notifier's `domain` parameter is just the display label; the app name reads
+            // naturally in the banner ("Blocked Discord — 3 times so far").
+            await notifyIfGrew(key: key, label: app.name, notifier: notifier,
+                               before: previous.counts[key] ?? 0, after: fresh.counts[key] ?? 0)
         }
     }
 
+    /// Post one banner for `label` if its tally grew, rate-limited per `key`.
+    private func notifyIfGrew(key: String, label: String, notifier: BlockNotifying,
+                              before: Int, after: Int) async {
+        guard after > before else { return }
+        let currentTime = clock()
+        if let last = lastNotified[key], currentTime.timeIntervalSince(last) < notificationInterval {
+            return
+        }
+        lastNotified[key] = currentTime
+        await notifier.notifyBlocked(domain: label, count: after)
+    }
+
+    /// Sum of the tallies for a domain and its subdomains. App tallies live in the same
+    /// dictionary under `BlockedApp.statsKeyPrefix` and are skipped — a bundle id such as
+    /// `com.example.app` must never fold into the site `example.app` by suffix.
     private static func aggregate(_ stats: BlockStats, for domain: String) -> Int {
         stats.counts.reduce(0) { sum, entry in
-            entry.key == domain || entry.key.hasSuffix("." + domain) ? sum + entry.value : sum
+            guard !entry.key.hasPrefix(BlockedApp.statsKeyPrefix) else { return sum }
+            return entry.key == domain || entry.key.hasSuffix("." + domain) ? sum + entry.value : sum
         }
     }
 
@@ -327,40 +514,82 @@ public final class AppModel: ObservableObject {
 
     // MARK: - Internals
 
-    private func persist() {
-        do { try store.save(blockList) }
-        catch { status = "Couldn't save your list: \(error.localizedDescription)" }
-    }
-
-    private func pushToSystem() async {
+    /// Save the list. Returns (and shows) the failure message, if any, so a caller whose next
+    /// step resets `status` on success can re-surface it via `surface(_:)`.
+    @discardableResult
+    private func persist() -> String? {
         do {
-            let expected = blockList.allBlockedHosts()
-            try await hosts.apply(expected)
-            // Verify the write actually landed. `apply` returning without throwing does NOT prove
-            // the privileged helper ran (an unapproved helper never starts, yet the XPC layer can
-            // still resolve) — so read the live managed region back and require it to be EXACTLY
-            // what we asked for. Equality (not subset) matters for removals: a failed write that
-            // left the old, larger region live must not pass as "the removal landed".
-            let live = try await hosts.currentManagedHosts()
-            if Set(expected) == Set(live) {
-                systemBlockVerified = true
-                status = nil
-            } else {
-                systemBlockVerified = false
-                status = "Blocking isn't active — approve SiteBlock's helper in Login Items, then Retry."
-            }
+            try store.save(blockList)
+            return nil
         } catch {
-            systemBlockVerified = false
-            status = "Blocking isn't active — \(error.localizedDescription)"
+            let message = "Couldn't save your list: \(error.localizedDescription)"
+            status = message
+            return message
         }
     }
 
-    private func removeFromSystem() async {
-        do {
-            try await hosts.removeBlock()
+    /// Re-show a save failure that a successful system push cleared — otherwise the change is
+    /// silently lost at the next launch. A push failure already showing outranks it: "blocking
+    /// isn't active" is the more urgent news.
+    private func surface(_ saveError: String?) {
+        if let saveError, status == nil { status = saveError }
+    }
+
+    /// Enforce the current intent in the system: the hosts half and/or the app half, each
+    /// attempted independently so a failure in one never leaves the other unapplied. Then verify
+    /// BOTH by reading the live state back — `apply` returning without throwing does NOT prove
+    /// the privileged helper ran (an unapproved helper never starts, yet the XPC layer can still
+    /// resolve), so we require the live hosts region and the live app set to be EXACTLY what we
+    /// asked for. Equality (not subset) matters for removals: a failed write that left the old,
+    /// larger set live must not pass as "the removal landed".
+    private func pushToSystem(hosts pushHosts: Bool = true, apps pushApps: Bool = true) async {
+        var failure: String?
+        if pushHosts {
+            do { try await hosts.apply(blockList.allBlockedHosts()) }
+            catch { failure = error.localizedDescription }
+        }
+        if pushApps, let appBlocker {
+            do { try await appBlocker.applyBlockedApps(blockList.blockedBundleIDs()) }
+            catch { failure = failure ?? error.localizedDescription }
+        }
+        if let failure {
             systemBlockVerified = false
-        } catch {
-            status = "Couldn't update blocking: \(error.localizedDescription)"
+            status = "Blocking isn't active — \(failure)"
+            return
+        }
+        // Read back. Once the hosts half has failed the verdict is decided; skip the extra round trip.
+        let hostsOK = await hostsVerified()
+        let appsOK = hostsOK ? await appsVerified() : false
+        if hostsOK && appsOK {
+            systemBlockVerified = true
+            status = nil
+        } else {
+            systemBlockVerified = false
+            status = "Blocking isn't active — approve SiteBlock's helper in Login Items, then Retry."
         }
     }
+
+    /// Clear the system block — both halves by default, or only the ones still live when healing.
+    /// Each is attempted independently: a failed hosts removal must never leave the helper still
+    /// killing apps (or vice versa) — that would be a partial weaken the user cannot see or retry.
+    private func removeFromSystem(hosts removeHosts: Bool = true, apps removeApps: Bool = true) async {
+        var failure: String?
+        if removeHosts {
+            do { try await hosts.removeBlock() }
+            catch { failure = error.localizedDescription }
+        }
+        if removeApps, let appBlocker {
+            do { try await appBlocker.applyBlockedApps([]) }
+            catch { failure = failure ?? error.localizedDescription }
+        }
+        systemBlockVerified = false
+        if let failure {
+            status = Self.removalFailurePrefix + failure
+        } else if status?.hasPrefix(Self.removalFailurePrefix) == true {
+            // Healed: drop our own stale error, but leave any unrelated message alone.
+            status = nil
+        }
+    }
+
+    private static let removalFailurePrefix = "Couldn't update blocking: "
 }

@@ -145,3 +145,36 @@ This is the core safety mechanism — test it carefully.
 - To manually clear a stuck block: open `/etc/hosts` with `sudo`, delete the lines
   between (and including) the two marker comments, save, and flush DNS
   (`sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder`).
+- To manually clear a stuck **app** block (the helper restores its set at boot, independent of
+  the UI): `sudo rm "/Library/Application Support/SiteBlock/blockedapps.json"`, then restart the
+  helper (`sudo launchctl kickstart -k system/today.siteblock.helper`) or reboot.
+
+## 9. App blocking (Discord / Steam)
+
+App blocking is enforced by the root helper polling the process table once a second, so
+it can only be verified on a real Mac with the helper approved.
+
+1. With blocking **off**, open the popover → **Add app…** → pick **Discord**, then **Steam**.
+   Both appear in the list with their icons. Adding is instant (no prompt).
+2. Launch Discord and leave it running. **Turn on blocking.** Within ~1–4 s Discord quits
+   (polite quit first; force-kill after 3 s if it hangs). No notification banner and no
+   attempt count for this — killing an already-running app on turn-on is silent.
+3. Try to open Discord again. It appears briefly then closes within ~1 s. A banner
+   "SiteBlock kept you focused — Blocked Discord for the first time." appears and the row
+   shows `1×`. Relaunch a few times inside a minute: banners are rate-limited (one per
+   minute per app) but the count keeps growing on the next stats refresh (≤5 s).
+4. Launch Steam. Confirm `steam_osx` and all `Steam Helper` processes disappear
+   (`ps aux | grep -i steam`), not just the bootstrapper.
+5. Quit the SiteBlock menu bar app (Quit button). Launch Discord → it is still killed
+   (the helper enforces independently). Relaunch SiteBlock; header still shows
+   **Blocking on** (verified), row counts persisted.
+6. Reboot. Discord/Steam auto-launch at login → killed within seconds, even before SiteBlock's
+   UI reconciles (the helper restores its set from
+   `/Library/Application Support/SiteBlock/blockedapps.json`).
+7. Click the trash icon on Discord → "Removing Discord in 5:00" countdown; Cancel works;
+   after 5 min a 2-min "Confirm — enter password" window appears; confirming prompts for the
+   Mac password with reason "remove Discord from your block list"; afterwards Discord launches
+   normally.
+8. **Turn off blocking** (gated) → after confirming, both Discord and Steam launch normally and
+   `blockedapps.json` contains `[]`.
+9. Sanity: SiteBlock itself and Finder never appear in the **Add app…** menu.

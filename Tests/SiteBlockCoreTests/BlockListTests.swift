@@ -36,7 +36,7 @@ final class BlockListTests: XCTestCase {
 
     // MARK: persistence
 
-    func testCodableRoundTripHasOnlyDomainsAndBlocking() throws {
+    func testCodableRoundTripHasNoTimerState() throws {
         let list = BlockList(domains: ["facebook.com"], isBlocking: true)
         let data = try JSONEncoder().encode(list)
         let json = try XCTUnwrap(String(data: data, encoding: .utf8))
@@ -45,7 +45,9 @@ final class BlockListTests: XCTestCase {
         // No transient timer state leaks into the persisted form.
         XCTAssertFalse(json.lowercased().contains("cooling"))
         XCTAssertFalse(json.lowercased().contains("deadline"))
-        XCTAssertFalse(json.lowercased().contains("window"))
+        // (The configured gate LENGTHS — `settings.windowMinutes` — are persisted on purpose.)
+        XCTAssertFalse(json.lowercased().contains("windowends"))
+        XCTAssertFalse(json.lowercased().contains("armed"))
 
         let decoded = try JSONDecoder().decode(BlockList.self, from: data)
         XCTAssertEqual(decoded, list)

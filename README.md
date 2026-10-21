@@ -8,6 +8,9 @@ restrictions, deliberately slow to remove them.**
 - **Weaken deliberately** — turning blocking off, or removing a domain, requires a **5-minute
   cooldown → a 2-minute confirmation window → your Mac password**. Miss the window and you start
   over. Quitting or restarting resets a pending timer (blocking stays on).
+- **Tune while off** — with blocking off you can pause individual sites/apps (they stay listed but
+  are left out of the block) and lengthen the wait / confirm window (5 and 2 minutes are the
+  minimum). Resuming a paused item works any time and applies instantly.
 
 Blocking works by writing a managed region into `/etc/hosts` (each domain → `127.0.0.1` + `::1`),
 so it covers every browser at once and persists across restarts. `www.` and common subdomains are

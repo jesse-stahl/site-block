@@ -19,6 +19,7 @@ struct SiteBlockApp: App {
             store: BlockListStore(url: BlockListStore.defaultURL()),
             hosts: helper,
             auth: PasswordAuth(),
+            apps: helper,
             statsProvider: helper,
             notifier: BlockNotificationBanner()
         )
