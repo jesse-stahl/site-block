@@ -37,7 +37,6 @@ final class EndToEndTests: XCTestCase {
             store: BlockListStore(url: dir.appendingPathComponent("blocklist.json")),
             hosts: DiskHosts(path: hostsPath),
             auth: OKAuth(),
-            friction: FrictionMachine(cooldown: 300, window: 120),
             clock: { clockNow }
         )
 

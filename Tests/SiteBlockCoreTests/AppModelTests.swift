@@ -69,7 +69,6 @@ final class AppModelTests: XCTestCase {
         let auth = FakeAuth()
         let clock = TestClock(t0)
         let model = AppModel(store: BlockListStore(url: url), hosts: hosts, auth: auth,
-                             friction: FrictionMachine(cooldown: 300, window: 120),
                              clock: { clock.now })
         return (model, hosts, auth, clock)
     }
@@ -412,7 +411,6 @@ final class AppModelTests: XCTestCase {
         let clock = TestClock(t0)
         let model = AppModel(store: BlockListStore(url: url), hosts: FakeHosts(), auth: FakeAuth(),
                              statsProvider: provider, notifier: notifier,
-                             friction: FrictionMachine(cooldown: 300, window: 120),
                              notificationInterval: 60,
                              clock: { clock.now })
         return (model, provider, notifier, clock)

@@ -2,12 +2,16 @@ import SwiftUI
 import ServiceManagement
 import SiteBlockCore
 
-/// The menu bar popover: master toggle, add-domain field, the domain list, and the blocked-app
-/// list — with the gated countdown/confirm UI surfacing whenever a weaken action is pending.
+/// The menu bar popover: master toggle, add-domain field, the domain list, the blocked-app list
+/// and the gate settings — with the gated countdown/confirm UI surfacing whenever a weaken action
+/// is pending. Resizable from the bottom-right grip; the size is remembered.
 struct MenuBarView: View {
 
     @ObservedObject var model: AppModel
     @State private var newDomain: String = ""
+    @State private var showSettings = false
+    @AppStorage("popoverWidth") private var width: Double = 340
+    @AppStorage("popoverHeight") private var height: Double = 560
     @State private var installedApps: [InstalledApp] = []
     /// Resolved icons for the blocked apps, keyed by bundle id — filled off-main, never in `body`.
     @State private var appIcons: [String: NSImage] = [:]
@@ -23,8 +27,15 @@ struct MenuBarView: View {
             }
             masterToggle
             addField
-            domainList
-            appSection
+            // The lists take whatever height the user gives the window.
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    domainList
+                    appSection
+                }
+            }
+            .frame(maxHeight: .infinity, alignment: .top)
+            settingsSection
             if let status = model.status {
                 Text(status).font(.caption).foregroundStyle(.secondary)
             }
@@ -32,7 +43,10 @@ struct MenuBarView: View {
             footer
         }
         .padding(14)
-        .frame(width: 320)
+        .frame(width: width, height: height)
+        .overlay(alignment: .bottomTrailing) {
+            ResizeGrip(width: $width, height: $height)
+        }
         // Drive the friction countdown only while something is pending.
         .onReceive(tick) { _ in
             if model.pending != nil { model.tick() }
@@ -147,14 +161,11 @@ struct MenuBarView: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(model.domains, id: \.self) { domain in
-                            domainRow(domain)
-                        }
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(model.domains, id: \.self) { domain in
+                        domainRow(domain)
                     }
                 }
-                .frame(maxHeight: 200)
             }
         }
     }
@@ -164,6 +175,9 @@ struct MenuBarView: View {
                      pendingLabel: "Removing \(domain)",
                      count: model.blockedCount(for: domain),
                      countHelp: "Blocked attempts",
+                     isPaused: model.isDomainPaused(domain),
+                     onPause: { model.pauseDomain(domain) },
+                     onResume: { Task { await model.resumeDomain(domain) } },
                      onRemove: { model.requestRemove(domain) }) {
             Text(domain).font(.body.monospaced())
         }
@@ -191,14 +205,11 @@ struct MenuBarView: View {
             }
 
             if !model.apps.isEmpty {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(model.apps, id: \.bundleID) { app in
-                            appRow(app)
-                        }
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(model.apps, id: \.bundleID) { app in
+                        appRow(app)
                     }
                 }
-                .frame(maxHeight: 140)
             }
         }
         .task(id: model.apps.map(\.bundleID)) {
@@ -213,6 +224,9 @@ struct MenuBarView: View {
                      pendingLabel: "Removing \(app.name)",
                      count: model.blockedCount(forApp: app.bundleID),
                      countHelp: "Blocked launches",
+                     isPaused: model.isAppPaused(app.bundleID),
+                     onPause: { model.pauseApp(app.bundleID) },
+                     onResume: { Task { await model.resumeApp(app.bundleID) } },
                      onRemove: { model.requestRemoveApp(app.bundleID) }) {
             appLabel(app)
         }
@@ -232,13 +246,17 @@ struct MenuBarView: View {
     }
 
     /// One list row for anything removable through the friction gate (a domain or an app): the
-    /// label, the blocked tally, and a trash button — or, while this row's removal is pending,
-    /// the shared countdown/confirm controls.
+    /// label, the blocked tally, a pause/resume toggle and a trash button — or, while this row's
+    /// removal is pending, the shared countdown/confirm controls. Pausing is only offered while
+    /// blocking is off; resuming always works (it strengthens the block).
     @ViewBuilder
     private func removableRow<Content: View>(isPending: Bool,
                                            pendingLabel: String,
                                            count: Int,
                                            countHelp: String,
+                                           isPaused: Bool,
+                                           onPause: @escaping () -> Void,
+                                           onResume: @escaping () -> Void,
                                            onRemove: @escaping () -> Void,
                                            @ViewBuilder label: () -> Content) -> some View {
         if isPending {
@@ -251,12 +269,27 @@ struct MenuBarView: View {
         } else {
             HStack {
                 label()
+                    .opacity(isPaused ? 0.45 : 1)
+                if isPaused {
+                    Text("Paused").font(.caption2).foregroundStyle(.secondary)
+                }
                 Spacer()
                 if count > 0 {
                     Text("\(count)×")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                         .help(countHelp)
+                }
+                if isPaused {
+                    Button(action: onResume) { Image(systemName: "play.fill") }
+                        .buttonStyle(.borderless)
+                        .help("Resume blocking")
+                } else {
+                    Button(action: onPause) { Image(systemName: "pause.fill") }
+                        .buttonStyle(.borderless)
+                        .help(model.canPause ? "Pause — leave it out when blocking is on"
+                                             : "Turn off blocking to pause")
+                        .disabled(!model.canPause)
                 }
                 Button {
                     model.tick()
@@ -265,7 +298,7 @@ struct MenuBarView: View {
                     Image(systemName: "trash")
                 }
                 .buttonStyle(.borderless)
-                .help("Remove (requires the 5-minute wait)")
+                .help("Remove (requires the \(model.settings.cooldownMinutes)-minute wait)")
                 .disabled(model.pending != nil)
             }
         }
@@ -298,6 +331,38 @@ struct MenuBarView: View {
         }
     }
 
+    /// The gate lengths. Editable only while blocking is off and nothing is pending; the steppers'
+    /// ranges start at the 5/2-minute floor, so the gate can only be made stricter.
+    private var settingsSection: some View {
+        DisclosureGroup(isExpanded: $showSettings) {
+            VStack(alignment: .leading, spacing: 6) {
+                Stepper(value: Binding(get: { model.settings.cooldownMinutes },
+                                       set: { model.setCooldownMinutes($0) }),
+                        in: FrictionSettings.cooldownRange) {
+                    Text("Wait before unblocking: \(model.settings.cooldownMinutes) min")
+                }
+                Stepper(value: Binding(get: { model.settings.windowMinutes },
+                                       set: { model.setWindowMinutes($0) }),
+                        in: FrictionSettings.windowRange) {
+                    Text("Time to confirm: \(model.settings.windowMinutes) min")
+                }
+                Text(settingsHint).font(.caption2).foregroundStyle(.secondary)
+            }
+            .font(.caption)
+            .disabled(!model.canChangeSettings)
+            .padding(.top, 4)
+        } label: {
+            Text("Settings").font(.caption)
+        }
+    }
+
+    private var settingsHint: String {
+        if model.isBlocking { return "Turn off blocking to change these." }
+        if model.pending != nil { return "Finish or cancel the pending removal first." }
+        return "Minimums are \(FrictionSettings.cooldownRange.lowerBound) and "
+            + "\(FrictionSettings.windowRange.lowerBound) minutes."
+    }
+
     private var footer: some View {
         HStack {
             Text(model.blockStats.total > 0
@@ -309,6 +374,8 @@ struct MenuBarView: View {
             Button("Quit") { NSApplication.shared.terminate(nil) }
                 .font(.caption)
         }
+        // Keep the footer clear of the resize grip.
+        .padding(.trailing, 12)
     }
 
     // MARK: actions
@@ -322,5 +389,43 @@ struct MenuBarView: View {
     private func format(_ interval: TimeInterval) -> String {
         let total = Int(interval.rounded(.up))
         return String(format: "%d:%02d", total / 60, total % 60)
+    }
+}
+
+/// A bottom-right corner grip that resizes the popover. Deltas come from the mouse's SCREEN
+/// position, not the gesture's translation: the menu bar window re-anchors itself under the
+/// status item as it grows, which would feed back into a view-local translation and jitter.
+private struct ResizeGrip: View {
+
+    @Binding var width: Double
+    @Binding var height: Double
+
+    private static let minSize = CGSize(width: 320, height: 420)
+    private static let maxWidth: CGFloat = 900
+
+    @State private var dragStart: (size: CGSize, mouse: NSPoint)?
+
+    var body: some View {
+        Image(systemName: "arrow.down.right")
+            .font(.system(size: 9, weight: .semibold))
+            .foregroundStyle(.tertiary)
+            .frame(width: 18, height: 18)
+            .contentShape(Rectangle())
+            .help("Drag to resize")
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { _ in
+                        let mouse = NSEvent.mouseLocation
+                        let start = dragStart ?? (CGSize(width: width, height: height), mouse)
+                        dragStart = start
+                        // Screen y grows upward, so dragging down makes the window taller.
+                        let maxHeight = (NSScreen.main?.visibleFrame.height ?? 900) - 20
+                        width = Double(min(max(start.size.width + mouse.x - start.mouse.x, Self.minSize.width),
+                                           Self.maxWidth))
+                        height = Double(min(max(start.size.height + start.mouse.y - mouse.y, Self.minSize.height),
+                                            maxHeight))
+                    }
+                    .onEnded { _ in dragStart = nil }
+            )
     }
 }

@@ -45,9 +45,13 @@ public protocol BlockNotifying {
 /// The observable app state and all of SiteBlock's action logic, independent of SwiftUI so it can
 /// be unit-tested. Enforces the asymmetric friction model:
 ///
-/// - **Strengthen** (turn ON, add a domain, add an app) — applied immediately, no gate.
-/// - **Weaken** (turn OFF, remove a domain, remove an app) — routed through `FrictionMachine`: a
-///   5-minute cooldown, then a 2-minute confirmation window, then a Mac-password prompt.
+/// - **Strengthen** (turn ON, add or resume a domain/app) — applied immediately, no gate.
+/// - **Weaken** (turn OFF, remove a domain/app) — routed through `FrictionMachine`: a cooldown
+///   (5 min or longer, per `FrictionSettings`), then a confirmation window (2 min or longer), then
+///   a Mac-password prompt.
+/// - **Off-only** (pause a domain/app, change the gate lengths) — free, but only while blocking is
+///   off, where there is nothing live to weaken. With blocking on they're unavailable: the way
+///   there is turning blocking off, which pays the gate.
 ///
 /// Time comes from an injected `clock` closure (defaults to `Date()`), so the view can drive a
 /// real display timer while tests drive it deterministically. Critically, the confirmation window
@@ -110,7 +114,6 @@ public final class AppModel: ObservableObject {
                 apps: AppBlockApplying? = nil,
                 statsProvider: BlockStatsProviding? = nil,
                 notifier: BlockNotifying? = nil,
-                friction: FrictionMachine = FrictionMachine(),
                 notificationInterval: TimeInterval = 60,
                 clock: @escaping () -> Date = { Date() }) {
         self.store = store
@@ -119,16 +122,28 @@ public final class AppModel: ObservableObject {
         self.appBlocker = apps
         self.statsProvider = statsProvider
         self.notifier = notifier
-        self.friction = friction
         self.notificationInterval = notificationInterval
         self.clock = clock
         self.now = clock()
-        self.blockList = (try? store.load()) ?? BlockList()
+        let loaded = (try? store.load()) ?? BlockList()
+        self.blockList = loaded
+        self.friction = Self.machine(for: loaded.settings)
     }
 
     public var isBlocking: Bool { blockList.isBlocking }
     public var domains: [String] { blockList.domains }
     public var apps: [BlockedApp] { blockList.apps }
+    public var settings: FrictionSettings { blockList.settings }
+
+    public func isDomainPaused(_ domain: String) -> Bool { blockList.isDomainPaused(domain) }
+    public func isAppPaused(_ bundleID: String) -> Bool { blockList.isAppPaused(bundleID) }
+
+    /// Pausing an item and changing the gate lengths are only possible while blocking is off.
+    public var canPause: Bool { !blockList.isBlocking }
+
+    /// …and the gate lengths also not while a weaken action is mid-countdown, so a running timer
+    /// is never shortened (or silently restarted) underneath the user.
+    public var canChangeSettings: Bool { !blockList.isBlocking && pending == nil }
 
     /// The truthful blocking state for the UI: distinguishes "on and actually enforced" from
     /// "on but not enforced" (helper unapproved / write failed) so the app can never claim it's
@@ -229,6 +244,24 @@ public final class AppModel: ObservableObject {
         surface(saveError)
     }
 
+    /// Resume a paused domain. A strengthen action — instant, and applied live if blocking is on.
+    public func resumeDomain(_ domain: String) async {
+        guard blockList.setDomainPaused(domain, false) else { return }
+        status = nil
+        let saveError = persist()
+        if blockList.isBlocking { await pushToSystem(apps: false) }
+        surface(saveError)
+    }
+
+    /// Resume a paused app. A strengthen action — instant, and applied live if blocking is on.
+    public func resumeApp(_ bundleID: String) async {
+        guard blockList.setAppPaused(bundleID, false) else { return }
+        status = nil
+        let saveError = persist()
+        if blockList.isBlocking { await pushToSystem(hosts: false) }
+        surface(saveError)
+    }
+
     /// Turn blocking on. Instant, no gate.
     public func turnBlockingOn() async {
         guard !blockList.isBlocking else { return }
@@ -236,6 +269,45 @@ public final class AppModel: ObservableObject {
         let saveError = persist()
         await pushToSystem()
         surface(saveError)
+    }
+
+    // MARK: - Off-only actions (free, but only while blocking is off)
+
+    /// Pause a domain so the next "turn on" leaves it out. No-op while blocking is on.
+    public func pauseDomain(_ domain: String) {
+        guard canPause, blockList.setDomainPaused(domain, true) else { return }
+        persist()
+    }
+
+    /// Pause an app so the next "turn on" leaves it out. No-op while blocking is on.
+    public func pauseApp(_ bundleID: String) {
+        guard canPause, blockList.setAppPaused(bundleID, true) else { return }
+        persist()
+    }
+
+    /// Set the wait before a weaken action can be confirmed (clamped to
+    /// `FrictionSettings.cooldownRange`). No-op unless `canChangeSettings`.
+    public func setCooldownMinutes(_ minutes: Int) {
+        guard canChangeSettings else { return }
+        update(FrictionSettings(cooldownMinutes: minutes, windowMinutes: settings.windowMinutes))
+    }
+
+    /// Set how long the confirmation window stays open (clamped to `FrictionSettings.windowRange`).
+    /// No-op unless `canChangeSettings`.
+    public func setWindowMinutes(_ minutes: Int) {
+        guard canChangeSettings else { return }
+        update(FrictionSettings(cooldownMinutes: settings.cooldownMinutes, windowMinutes: minutes))
+    }
+
+    private func update(_ newSettings: FrictionSettings) {
+        guard newSettings != blockList.settings else { return }
+        blockList.settings = newSettings
+        friction = Self.machine(for: newSettings)
+        persist()
+    }
+
+    private static func machine(for settings: FrictionSettings) -> FrictionMachine {
+        FrictionMachine(cooldown: settings.cooldown, window: settings.window)
     }
 
     // MARK: - Weaken actions (gated: cooldown -> window -> password)

@@ -1,7 +1,7 @@
 import Foundation
 
-/// The persisted state of the blocker: the user's domains, blocked apps, and whether blocking is
-/// currently on.
+/// The persisted state of the blocker: the user's domains, blocked apps, which of those are
+/// paused, the gate lengths, and whether blocking is currently on.
 ///
 /// Deliberately does NOT include any pending-timer state — the friction cooldown/window is
 /// transient and resets on quit/restart (see `FrictionMachine`), so it is never serialized.
@@ -13,23 +13,48 @@ public struct BlockList: Codable, Equatable {
     /// Apps the user has added, in insertion order.
     public private(set) var apps: [BlockedApp]
 
+    /// Domains on the list but left out of the block, in pause order. Always a subset of `domains`.
+    public private(set) var pausedDomains: [String]
+
+    /// Bundle ids (canonical, as listed in `apps`) on the list but left out of the block.
+    public private(set) var pausedApps: [String]
+
     /// Whether blocking is currently active.
     public var isBlocking: Bool
 
-    public init(domains: [String] = [], apps: [BlockedApp] = [], isBlocking: Bool = false) {
+    /// The weaken gate's lengths. Gating changes to them is the caller's responsibility.
+    public var settings: FrictionSettings
+
+    public init(domains: [String] = [], apps: [BlockedApp] = [], isBlocking: Bool = false,
+                settings: FrictionSettings = FrictionSettings()) {
         self.domains = domains
         self.apps = apps
+        self.pausedDomains = []
+        self.pausedApps = []
         self.isBlocking = isBlocking
+        self.settings = settings
     }
 
-    private enum CodingKeys: String, CodingKey { case domains, apps, isBlocking }
+    private enum CodingKeys: String, CodingKey {
+        case domains, apps, pausedDomains, pausedApps, isBlocking, settings
+    }
 
-    /// Custom decoding so block lists saved before app blocking existed (no `apps` key) still load.
+    /// Custom decoding so block lists saved by older versions (no `apps`, pause or `settings`
+    /// keys) still load. Pause entries that no longer match a listed item are dropped.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         domains = try c.decodeIfPresent([String].self, forKey: .domains) ?? []
         apps = try c.decodeIfPresent([BlockedApp].self, forKey: .apps) ?? []
         isBlocking = try c.decodeIfPresent(Bool.self, forKey: .isBlocking) ?? false
+        settings = try c.decodeIfPresent(FrictionSettings.self, forKey: .settings) ?? FrictionSettings()
+        pausedDomains = []
+        pausedApps = []
+        for domain in try c.decodeIfPresent([String].self, forKey: .pausedDomains) ?? [] {
+            setDomainPaused(domain, true)
+        }
+        for id in try c.decodeIfPresent([String].self, forKey: .pausedApps) ?? [] {
+            setAppPaused(id, true)
+        }
     }
 
     // MARK: domains
@@ -50,15 +75,31 @@ public struct BlockList: Codable, Equatable {
         let host = Domain.normalize(domain) ?? domain
         guard let idx = domains.firstIndex(of: host) else { return false }
         domains.remove(at: idx)
+        pausedDomains.removeAll { $0 == host }
         return true
     }
 
-    /// Every host that should be written to the hosts file: each domain expanded to its
+    /// Whether a listed domain is paused.
+    public func isDomainPaused(_ domain: String) -> Bool {
+        pausedDomains.contains(Domain.normalize(domain) ?? domain)
+    }
+
+    /// Pause or resume a listed domain. Returns `true` if its state changed. Pausing is a weaken
+    /// action — gating it is the caller's responsibility.
+    @discardableResult
+    public mutating func setDomainPaused(_ domain: String, _ paused: Bool) -> Bool {
+        let host = Domain.normalize(domain) ?? domain
+        guard domains.contains(host), isDomainPaused(host) != paused else { return false }
+        if paused { pausedDomains.append(host) } else { pausedDomains.removeAll { $0 == host } }
+        return true
+    }
+
+    /// Every host that should be written to the hosts file: each unpaused domain expanded to its
     /// `www.`/common-subdomain variants, deduplicated across the whole list, order-stable.
     public func allBlockedHosts() -> [String] {
         var result: [String] = []
         var seen = Set<String>()
-        for domain in domains {
+        for domain in domains where !pausedDomains.contains(domain) {
             for host in Domain.expand(domain) where !seen.contains(host) {
                 seen.insert(host)
                 result.append(host)
@@ -87,13 +128,30 @@ public struct BlockList: Codable, Equatable {
     @discardableResult
     public mutating func removeApp(bundleID: String) -> Bool {
         guard let idx = indexOfApp(bundleID) else { return false }
-        apps.remove(at: idx)
+        let removed = apps.remove(at: idx)
+        pausedApps.removeAll { $0 == removed.bundleID }
         return true
     }
 
-    /// The bundle identifiers to hand to the helper for enforcement, in insertion order.
+    /// Whether a listed app (any casing) is paused.
+    public func isAppPaused(_ bundleID: String) -> Bool {
+        guard let app = app(for: bundleID) else { return false }
+        return pausedApps.contains(app.bundleID)
+    }
+
+    /// Pause or resume a listed app (any casing). Returns `true` if its state changed. Pausing is
+    /// a weaken action — gating it is the caller's responsibility.
+    @discardableResult
+    public mutating func setAppPaused(_ bundleID: String, _ paused: Bool) -> Bool {
+        guard let id = app(for: bundleID)?.bundleID, isAppPaused(id) != paused else { return false }
+        if paused { pausedApps.append(id) } else { pausedApps.removeAll { $0 == id } }
+        return true
+    }
+
+    /// The bundle identifiers to hand to the helper for enforcement (unpaused apps), in insertion
+    /// order.
     public func blockedBundleIDs() -> [String] {
-        apps.map(\.bundleID)
+        apps.map(\.bundleID).filter { !pausedApps.contains($0) }
     }
 
     /// The blocked app matching `bundleID` (case-insensitive), or nil if it isn't on the list.

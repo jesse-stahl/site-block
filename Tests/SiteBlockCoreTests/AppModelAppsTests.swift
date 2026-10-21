@@ -65,7 +65,6 @@ final class AppModelAppsTests: XCTestCase {
         let stats = FakeStatsProvider(), notifier = FakeNotifier(), clock = TestClock(t0)
         let model = AppModel(store: BlockListStore(url: url), hosts: hosts, auth: auth,
                              apps: apps, statsProvider: stats, notifier: notifier,
-                             friction: FrictionMachine(cooldown: 300, window: 120),
                              notificationInterval: 60, clock: { clock.now })
         return (model, hosts, apps, auth, stats, notifier, clock)
     }
@@ -377,7 +376,7 @@ final class AppModelAppsTests: XCTestCase {
         let apps = FakeAppBlocker()
         let model = AppModel(store: BlockListStore(url: blocker.appendingPathComponent("blocklist.json")),
                              hosts: FakeHosts(), auth: FakeAuth(), apps: apps,
-                             friction: FrictionMachine(cooldown: 300, window: 120), clock: { self.t0 })
+                             clock: { self.t0 })
         return (model, apps)
     }
 
@@ -419,7 +418,7 @@ final class AppModelAppsTests: XCTestCase {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("siteblock-apps-\(UUID().uuidString)/blocklist.json")
         let model = AppModel(store: BlockListStore(url: url), hosts: FakeHosts(), auth: FakeAuth(),
-                             friction: FrictionMachine(cooldown: 300, window: 120), clock: { self.t0 })
+                             clock: { self.t0 })
         await model.addApp(bundleID: discord, name: "Discord")
         await model.turnBlockingOn()
         XCTAssertEqual(model.blockingStatus, .active, "nil app blocker: legacy behaviour untouched")
