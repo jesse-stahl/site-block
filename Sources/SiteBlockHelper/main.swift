@@ -1,4 +1,5 @@
 import Foundation
+import Security
 import SiteBlockCore
 
 /// The privileged helper daemon. Registered once via `SMAppService`, it runs as root and performs
@@ -128,13 +129,35 @@ final class HostsControlService: NSObject, HostsControlProtocol {
 final class HelperListenerDelegate: NSObject, NSXPCListenerDelegate {
     private let service = HostsControlService()
 
+    /// Built once from the helper's own signature, so the app and helper only need to share a
+    /// signing team — no team id is baked into the source.
+    private let clientRequirement: String? = ownTeamIdentifier().flatMap(HelperInfo.clientRequirement(teamID:))
+
     func listener(_ listener: NSXPCListener,
                   shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
+        // Unsigned helper (or unreadable signature) → accept nobody rather than everybody.
+        guard let clientRequirement else { return false }
+        // The system checks the caller's signature and invalidates the connection on mismatch,
+        // before any message reaches the service.
+        newConnection.setCodeSigningRequirement(clientRequirement)
         newConnection.exportedInterface = NSXPCInterface(with: HostsControlProtocol.self)
         newConnection.exportedObject = service
         newConnection.resume()
         return true
     }
+}
+
+/// The team identifier this helper binary is signed with, or nil if it is unsigned/ad-hoc.
+private func ownTeamIdentifier() -> String? {
+    var code: SecCode?
+    guard SecCodeCopySelf([], &code) == errSecSuccess, let code else { return nil }
+    var staticCode: SecStaticCode?
+    guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode else { return nil }
+    var info: CFDictionary?
+    guard SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation),
+                                        &info) == errSecSuccess,
+          let dict = info as? [String: Any] else { return nil }
+    return dict[kSecCodeInfoTeamIdentifier as String] as? String
 }
 
 let delegate = HelperListenerDelegate()

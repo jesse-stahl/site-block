@@ -159,7 +159,7 @@ public final class AppModel: ObservableObject {
             // paid the gate for.
             let hostsLive = await hostsStillLive()
             let appsLive = await appsStillLive()
-            if hostsLive || appsLive { await removeFromSystem() }
+            if hostsLive || appsLive { await removeFromSystem(hosts: hostsLive, apps: appsLive) }
             return
         }
         // Unreachable helper → we can no longer vouch for enforcement; pushToSystem below will
@@ -207,11 +207,12 @@ public final class AppModel: ObservableObject {
             status = "That doesn't look like a valid domain."
             return
         }
-        persist()
         status = nil
+        let saveError = persist()
         if blockList.isBlocking {
-            await pushToSystem()
+            await pushToSystem(apps: false)
         }
+        surface(saveError)
     }
 
     /// Add an app by bundle identifier. Instant. Applies to the live system if blocking is on.
@@ -220,19 +221,21 @@ public final class AppModel: ObservableObject {
             status = "That app couldn't be added."
             return
         }
-        persist()
         status = nil
+        let saveError = persist()
         if blockList.isBlocking {
-            await pushToSystem()
+            await pushToSystem(hosts: false)
         }
+        surface(saveError)
     }
 
     /// Turn blocking on. Instant, no gate.
     public func turnBlockingOn() async {
         guard !blockList.isBlocking else { return }
         blockList.isBlocking = true
-        persist()
+        let saveError = persist()
         await pushToSystem()
+        surface(saveError)
     }
 
     // MARK: - Weaken actions (gated: cooldown -> window -> password)
@@ -333,12 +336,14 @@ public final class AppModel: ObservableObject {
             await removeFromSystem()
         case .removeDomain(let domain):
             blockList.remove(domain)
-            persist()
-            if blockList.isBlocking { await pushToSystem() }
+            let saveError = persist()
+            if blockList.isBlocking { await pushToSystem(apps: false) }
+            surface(saveError)
         case .removeApp(let id):
             blockList.removeApp(bundleID: id)
-            persist()
-            if blockList.isBlocking { await pushToSystem() }
+            let saveError = persist()
+            if blockList.isBlocking { await pushToSystem(hosts: false) }
+            surface(saveError)
         }
         friction.reset()
         self.pending = nil
@@ -437,9 +442,25 @@ public final class AppModel: ObservableObject {
 
     // MARK: - Internals
 
-    private func persist() {
-        do { try store.save(blockList) }
-        catch { status = "Couldn't save your list: \(error.localizedDescription)" }
+    /// Save the list. Returns (and shows) the failure message, if any, so a caller whose next
+    /// step resets `status` on success can re-surface it via `surface(_:)`.
+    @discardableResult
+    private func persist() -> String? {
+        do {
+            try store.save(blockList)
+            return nil
+        } catch {
+            let message = "Couldn't save your list: \(error.localizedDescription)"
+            status = message
+            return message
+        }
+    }
+
+    /// Re-show a save failure that a successful system push cleared — otherwise the change is
+    /// silently lost at the next launch. A push failure already showing outranks it: "blocking
+    /// isn't active" is the more urgent news.
+    private func surface(_ saveError: String?) {
+        if let saveError, status == nil { status = saveError }
     }
 
     /// Enforce the current intent in the system: the hosts half and/or the app half, each
@@ -476,18 +497,27 @@ public final class AppModel: ObservableObject {
         }
     }
 
-    /// Clear both halves in the system. Each is attempted independently: a failed hosts removal
-    /// must never leave the helper still killing apps (or vice versa) — that would be a partial
-    /// weaken the user cannot see or retry.
-    private func removeFromSystem() async {
+    /// Clear the system block — both halves by default, or only the ones still live when healing.
+    /// Each is attempted independently: a failed hosts removal must never leave the helper still
+    /// killing apps (or vice versa) — that would be a partial weaken the user cannot see or retry.
+    private func removeFromSystem(hosts removeHosts: Bool = true, apps removeApps: Bool = true) async {
         var failure: String?
-        do { try await hosts.removeBlock() }
-        catch { failure = error.localizedDescription }
-        if let appBlocker {
+        if removeHosts {
+            do { try await hosts.removeBlock() }
+            catch { failure = error.localizedDescription }
+        }
+        if removeApps, let appBlocker {
             do { try await appBlocker.applyBlockedApps([]) }
             catch { failure = failure ?? error.localizedDescription }
         }
         systemBlockVerified = false
-        if let failure { status = "Couldn't update blocking: \(failure)" }
+        if let failure {
+            status = Self.removalFailurePrefix + failure
+        } else if status?.hasPrefix(Self.removalFailurePrefix) == true {
+            // Healed: drop our own stale error, but leave any unrelated message alone.
+            status = nil
+        }
     }
+
+    private static let removalFailurePrefix = "Couldn't update blocking: "
 }

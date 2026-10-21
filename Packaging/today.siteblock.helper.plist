@@ -6,8 +6,9 @@
   is registered via SMAppService.daemon(plistName: "today.siteblock.helper.plist"). The
   MachServices name MUST match HelperInfo.machServiceName in SiteBlockCore.
 
-  Replace TEAMID with your Apple Developer Team ID (or the SHA of your local signing identity for
-  a personal build) so the daemon only accepts connections from the signed SiteBlock app.
+  Scripts/package.sh replaces TEAMID with your Apple Developer Team ID. Note SMAuthorizedClients
+  is an SMJobBless-era key that SMAppService does not enforce: the helper itself rejects any XPC
+  client not signed as today.siteblock.SiteBlock by its own team (see HelperInfo.clientRequirement).
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

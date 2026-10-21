@@ -3,40 +3,50 @@ import XCTest
 
 final class AppBundleTests: XCTestCase {
 
-    func testBundleRootIsOutermostContentsParent() {
+    func testBundleRootsListEveryEnclosingBundleInnermostFirst() {
         XCTAssertEqual(
-            AppBundle.bundleRoot(forExecutable: "/Applications/Discord.app/Contents/MacOS/Discord"),
-            "/Applications/Discord.app")
+            AppBundle.bundleRoots(forExecutable: "/Applications/Discord.app/Contents/MacOS/Discord"),
+            ["/Applications/Discord.app"])
         XCTAssertEqual(
-            AppBundle.bundleRoot(forExecutable:
+            AppBundle.bundleRoots(forExecutable:
                 "/Applications/Discord.app/Contents/Frameworks/Discord Helper (GPU).app/Contents/MacOS/Discord Helper (GPU)"),
-            "/Applications/Discord.app",
-            "nested helper apps resolve to the OUTER app")
+            ["/Applications/Discord.app/Contents/Frameworks/Discord Helper (GPU).app", "/Applications/Discord.app"],
+            "nested helper apps also belong to the OUTER app")
         XCTAssertEqual(
-            AppBundle.bundleRoot(forExecutable:
+            AppBundle.bundleRoots(forExecutable:
                 "/Users/j/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS/steam_osx"),
-            "/Users/j/Library/Application Support/Steam/Steam.AppBundle/Steam",
+            ["/Users/j/Library/Application Support/Steam/Steam.AppBundle/Steam"],
             "Steam's client bundle has no .app suffix")
     }
 
-    func testBundleRootIsNilForBareExecutables() {
-        XCTAssertNil(AppBundle.bundleRoot(forExecutable: "/usr/bin/ssh"))
-        XCTAssertNil(AppBundle.bundleRoot(forExecutable: ""))
-        XCTAssertNil(AppBundle.bundleRoot(forExecutable: "/Contents/MacOS/x"),
-                     "a root of empty string is not a bundle")
+    func testBundleRootsIncludeTheRealAppWhenAParentFolderIsNamedContents() {
+        // Moving the app under any folder called "Contents" must not hide it from the block.
+        XCTAssertEqual(
+            AppBundle.bundleRoots(forExecutable: "/Users/me/Contents/Discord.app/Contents/MacOS/Discord"),
+            ["/Users/me/Contents/Discord.app", "/Users/me"])
+        XCTAssertEqual(
+            AppBundle.bundleRoots(forExecutable: "/Users/me/Decoy.app/Contents/Steam.app/Contents/MacOS/steam_osx"),
+            ["/Users/me/Decoy.app/Contents/Steam.app", "/Users/me/Decoy.app"])
     }
 
-    func testBundleRootIsNilForToolsShippedInsideABundle() {
+    func testBundleRootsAreEmptyForBareExecutables() {
+        XCTAssertEqual(AppBundle.bundleRoots(forExecutable: "/usr/bin/ssh"), [])
+        XCTAssertEqual(AppBundle.bundleRoots(forExecutable: ""), [])
+        XCTAssertEqual(AppBundle.bundleRoots(forExecutable: "/Contents/MacOS/x"), [],
+                       "a root of empty string is not a bundle")
+    }
+
+    func testBundleRootsAreEmptyForToolsShippedInsideABundle() {
         // Blocking Xcode must not kill every `git`/`clang` other apps run from its toolchain.
-        XCTAssertNil(AppBundle.bundleRoot(forExecutable: "/Applications/Xcode.app/Contents/Developer/usr/bin/git"))
-        XCTAssertNil(AppBundle.bundleRoot(forExecutable:
-            "/Applications/Xcode.app/Contents/SharedFrameworks/LLDB.framework/Versions/A/Resources/lldb-rpc-server"))
+        XCTAssertEqual(AppBundle.bundleRoots(forExecutable: "/Applications/Xcode.app/Contents/Developer/usr/bin/git"), [])
+        XCTAssertEqual(AppBundle.bundleRoots(forExecutable:
+            "/Applications/Xcode.app/Contents/SharedFrameworks/LLDB.framework/Versions/A/Resources/lldb-rpc-server"), [])
         // …while Xcode itself and the apps nested under it are still the app.
-        XCTAssertEqual(AppBundle.bundleRoot(forExecutable: "/Applications/Xcode.app/Contents/MacOS/Xcode"),
-                       "/Applications/Xcode.app")
-        XCTAssertEqual(AppBundle.bundleRoot(forExecutable:
+        XCTAssertEqual(AppBundle.bundleRoots(forExecutable: "/Applications/Xcode.app/Contents/MacOS/Xcode"),
+                       ["/Applications/Xcode.app"])
+        XCTAssertEqual(AppBundle.bundleRoots(forExecutable:
             "/Applications/Xcode.app/Contents/Developer/Applications/Simulator.app/Contents/MacOS/Simulator"),
-            "/Applications/Xcode.app")
+            ["/Applications/Xcode.app/Contents/Developer/Applications/Simulator.app", "/Applications/Xcode.app"])
     }
 
     func testBundleIdentifierReadsInfoPlist() throws {

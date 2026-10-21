@@ -40,6 +40,8 @@ final class ProcessWatcher {
     private let enforcer: AppBlockEnforcer
     private let store: BlockedAppsStore
     private var timer: DispatchSourceTimer?
+    /// What `blockedapps.json` holds, as of the last successful load or save (queue-confined).
+    private var persistedBundleIDs: [String] = []
     /// Called (on `queue`) with each blocked bundle id whose launch was just stopped.
     private let onAttempt: (String) -> Void
 
@@ -57,27 +59,38 @@ final class ProcessWatcher {
     /// hasn't launched yet (Discord/Steam auto-start at login).
     func start() {
         let saved = (try? store.load()) ?? []
+        queue.async { [self] in persistedBundleIDs = saved }
         if !saved.isEmpty { setBlockedApps(saved) }
     }
 
     /// Replace the enforced set (kills running matches immediately, silently) and persist it.
     /// `completion` runs on `queue` once the set is live, with the persistence error if the
     /// write failed — the set is enforced in memory either way, but a caller must know that it
-    /// will not survive a reboot. Re-applying an identical set is a no-op (no sweep, no write).
+    /// will not survive a reboot. Re-applying an identical set is a no-op (no sweep, and no write
+    /// unless an earlier write failed).
     func setBlockedApps(_ bundleIDs: [String], completion: ((Error?) -> Void)? = nil) {
         queue.async { [self] in
+            enforcer.setBlockedBundleIDs(bundleIDs, now: Date())
+            // Compare against the disk copy, not the live set: after a failed write the live set
+            // already matches, and keying on "changed" would skip the retry forever.
             var saveError: Error?
-            if enforcer.setBlockedBundleIDs(bundleIDs, now: Date()) {
-                do { try store.save(bundleIDs) } catch { saveError = error }
+            if bundleIDs != persistedBundleIDs {
+                do {
+                    try store.save(bundleIDs)
+                    persistedBundleIDs = bundleIDs
+                } catch { saveError = error }
             }
             bundleIDs.isEmpty ? stopTimer() : startTimerIfNeeded()
             completion?(saveError)
         }
     }
 
-    /// The set currently enforced (synchronous read for the XPC reply).
+    /// The set enforced now AND after a reboot (synchronous read for the XPC reply). This is the
+    /// saved copy: the live set is always updated first, so they only differ after a failed write
+    /// — and then the app must see a mismatch, not "verified", so it re-pushes and the write is
+    /// retried.
     func currentBlockedApps() -> [String] {
-        queue.sync { enforcer.blockedBundleIDs }
+        queue.sync { persistedBundleIDs }
     }
 
     private func startTimerIfNeeded() {

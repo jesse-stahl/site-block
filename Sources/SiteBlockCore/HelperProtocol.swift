@@ -10,6 +10,21 @@ public enum HelperInfo {
     /// The Mach service name the helper registers and the app connects to. Must match the
     /// helper's launchd plist `MachServices` key.
     public static let machServiceName = "today.siteblock.helper"
+
+    /// The menu bar app's bundle identifier — the only client the helper accepts.
+    public static let appBundleIdentifier = "today.siteblock.SiteBlock"
+
+    /// The code-signing requirement an XPC client must satisfy: the SiteBlock app, signed by the
+    /// same team as the helper. Without it any local process could drive a root daemon that
+    /// rewrites `/etc/hosts` and kills apps — or clear the block with no cooldown or password.
+    /// (`SMAuthorizedClients` in the launchd plist is an SMJobBless-era key that `SMAppService`
+    /// does not enforce, so the listener must check.) Nil for a malformed team id: fail closed.
+    public static func clientRequirement(teamID: String) -> String? {
+        guard teamID.count == 10,
+              teamID.allSatisfy({ ("A"..."Z").contains($0) || ("0"..."9").contains($0) }) else { return nil }
+        return "anchor apple generic and identifier \"\(appBundleIdentifier)\" "
+            + "and certificate leaf[subject.OU] = \"\(teamID)\""
+    }
 }
 
 /// The privileged operations the helper exposes over XPC. Kept intentionally tiny: all real

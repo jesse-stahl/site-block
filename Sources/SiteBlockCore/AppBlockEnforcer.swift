@@ -25,9 +25,9 @@ public protocol ProcessSignaling {
 
 /// The app-blocking engine, driven once per second by the root helper's `ProcessWatcher`.
 ///
-/// Each `sweep` maps every process → outermost bundle root (`AppBundle.bundleRoot`) → bundle id
-/// (cached per root; a plist read per process per second would be wasteful) and, for ids in the
-/// blocked set: SIGTERM on first sight, SIGKILL once `forceKillAfter` has elapsed and it is still
+/// Each `sweep` maps every process → each enclosing bundle root (`AppBundle.bundleRoots`) → bundle
+/// id (cached per root; a plist read per process per second would be wasteful) and, if any of
+/// those ids is in the blocked set: SIGTERM on first sight, SIGKILL once `forceKillAfter` has elapsed and it is still
 /// alive. Matching is case-insensitive. The helper's own pid, `AppBlockPolicy.neverBlock` and any
 /// extra `protectedBundleIDs` are never signalled, so neither a mis-click nor a hand-edited list
 /// can lock the user out.
@@ -99,9 +99,13 @@ public final class AppBlockEnforcer {
         var reported = Set<String>()
 
         for process in processes.runningProcesses() where process.pid != ownPID {
-            guard let root = AppBundle.bundleRoot(forExecutable: process.executablePath),
-                  let id = cachedIdentifier(root)?.lowercased(),
-                  let original = blocked[id], !protected.contains(id) else { continue }
+            let ids = AppBundle.bundleRoots(forExecutable: process.executablePath)
+                .compactMap { cachedIdentifier($0)?.lowercased() }
+            // Protection follows the process's OWN (innermost) bundle: SiteBlock/Finder are never
+            // signalled, but wrapping Steam in a decoy bundle claiming a protected id is no escape.
+            guard let own = ids.first, !protected.contains(own),
+                  let id = ids.first(where: { blocked[$0] != nil }),
+                  let original = blocked[id] else { continue }
             alive.insert(process.pid)
 
             if let sentAt = termSentAt[process.pid] {

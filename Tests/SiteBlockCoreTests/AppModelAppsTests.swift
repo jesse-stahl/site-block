@@ -5,9 +5,11 @@ private final class FakeHosts: HostsApplying, @unchecked Sendable {
     var live: [String] = []
     var applied: [[String]] = []
     var removeError: Error?
+    var removeCount = 0
     func apply(_ hosts: [String]) async throws { applied.append(hosts); live = hosts }
     func removeBlock() async throws {
         if let removeError { throw removeError }
+        removeCount += 1
         live = []
     }
     func currentManagedHosts() async throws -> [String] { live }
@@ -292,6 +294,114 @@ final class AppModelAppsTests: XCTestCase {
         stats.stats = BlockStats(counts: ["app:com.hnc.discord": 3])
         await model.refreshStats()
         XCTAssertEqual(notifier.notifications.count, 2)
+    }
+
+    // MARK: one half at a time
+
+    func testAddingOrRemovingAnAppNeverRewritesHosts() async {
+        let (model, hosts, apps, _, _, _, clock) = makeModel()
+        await model.addDomain("facebook.com")
+        await model.turnBlockingOn()
+        let hostWrites = hosts.applied.count
+
+        await model.addApp(bundleID: discord, name: "Discord")
+        model.requestRemoveApp(discord)
+        clock.advance(300); model.tick()
+        let removed = await model.confirmPending()
+        XCTAssertTrue(removed)
+
+        XCTAssertEqual(hosts.applied.count, hostWrites, "app-only changes leave /etc/hosts alone")
+        XCTAssertEqual(apps.applied.suffix(2), [[discord], []])
+        XCTAssertEqual(model.blockingStatus, .active, "both halves still verified")
+    }
+
+    func testAddingOrRemovingADomainNeverReappliesApps() async {
+        let (model, _, apps, _, _, _, clock) = makeModel()
+        await model.addApp(bundleID: discord, name: "Discord")
+        await model.turnBlockingOn()
+        let appWrites = apps.applied.count
+
+        await model.addDomain("facebook.com")
+        model.requestRemove("facebook.com")
+        clock.advance(300); model.tick()
+        let removed = await model.confirmPending()
+        XCTAssertTrue(removed)
+
+        XCTAssertEqual(apps.applied.count, appWrites)
+        XCTAssertEqual(model.blockingStatus, .active)
+    }
+
+    func testOffHealClearsOnlyTheHalfStillLive() async {
+        let (model, hosts, apps, _, _, _, _) = makeModel()
+        apps.live = [discord]                 // a turn-off whose app clear never landed
+        await model.verifyEnforcement()
+        XCTAssertEqual(apps.live, [])
+        XCTAssertEqual(hosts.removeCount, 0, "hosts were already clear — no privileged rewrite")
+
+        hosts.live = ["facebook.com"]
+        let appWrites = apps.applied.count
+        await model.verifyEnforcement()
+        XCTAssertEqual(hosts.live, [])
+        XCTAssertEqual(apps.applied.count, appWrites, "app set was already clear")
+    }
+
+    func testRemovalErrorClearsOnceTheOffHealSucceeds() async {
+        let (model, hosts, _, _, _, _, _) = makeModel()
+        hosts.live = ["facebook.com"]
+        hosts.removeError = FakeError()
+        await model.verifyEnforcement()
+        XCTAssertEqual(model.status?.hasPrefix("Couldn't update blocking"), true)
+
+        hosts.removeError = nil
+        await model.verifyEnforcement()
+        XCTAssertNil(model.status, "a healed failure must not linger on screen")
+    }
+
+    func testOffHealLeavesUnrelatedStatusAlone() async {
+        let (model, hosts, _, _, _, _, _) = makeModel()
+        await model.addApp(bundleID: "", name: "")             // sets an unrelated message
+        let message = model.status
+        XCTAssertNotNil(message)
+        hosts.live = ["facebook.com"]
+        await model.verifyEnforcement()
+        XCTAssertEqual(model.status, message)
+    }
+
+    // MARK: save failures stay visible
+
+    /// A model whose store can never be written: the store's directory path is a regular file.
+    private func makeUnsavableModel() throws -> (AppModel, FakeAppBlocker) {
+        let blocker = FileManager.default.temporaryDirectory
+            .appendingPathComponent("siteblock-apps-\(UUID().uuidString)")
+        try Data().write(to: blocker)
+        let apps = FakeAppBlocker()
+        let model = AppModel(store: BlockListStore(url: blocker.appendingPathComponent("blocklist.json")),
+                             hosts: FakeHosts(), auth: FakeAuth(), apps: apps,
+                             friction: FrictionMachine(cooldown: 300, window: 120), clock: { self.t0 })
+        return (model, apps)
+    }
+
+    func testAddAppSaveFailureIsShownEvenAfterASuccessfulPush() async throws {
+        let (model, apps) = try makeUnsavableModel()
+        await model.turnBlockingOn()
+        await model.addApp(bundleID: discord, name: "Discord")
+        XCTAssertEqual(apps.live, [discord], "still enforced for now")
+        XCTAssertEqual(model.status?.hasPrefix("Couldn't save your list"), true,
+                       "the user must learn the app won't survive a relaunch")
+    }
+
+    func testAddAppSaveFailureIsShownWhileOff() async throws {
+        let (model, _) = try makeUnsavableModel()
+        await model.addApp(bundleID: discord, name: "Discord")
+        XCTAssertEqual(model.status?.hasPrefix("Couldn't save your list"), true)
+    }
+
+    func testPushFailureOutranksSaveFailure() async throws {
+        let (model, apps) = try makeUnsavableModel()
+        await model.turnBlockingOn()
+        apps.applyError = FakeError()
+        await model.addApp(bundleID: discord, name: "Discord")
+        XCTAssertEqual(model.status?.hasPrefix("Blocking isn't active"), true)
     }
 
     // MARK: lifecycle / no app blocker

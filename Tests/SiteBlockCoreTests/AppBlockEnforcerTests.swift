@@ -24,7 +24,7 @@ final class AppBlockEnforcerTests: XCTestCase {
     let safari = RunningProcess(pid: 300, executablePath: "/Applications/Safari.app/Contents/MacOS/Safari")
     let ssh = RunningProcess(pid: 400, executablePath: "/usr/bin/ssh")
 
-    /// Bundle-ID lookup keyed by bundle ROOT (what `AppBundle.bundleRoot` returns).
+    /// Bundle-ID lookup keyed by bundle ROOT (what `AppBundle.bundleRoots` returns).
     let ids: [String: String] = [
         "/Applications/Discord.app": "com.hnc.Discord",
         "/Users/j/Library/Application Support/Steam/Steam.AppBundle/Steam": "com.valvesoftware.steam",
@@ -194,7 +194,51 @@ final class AppBlockEnforcerTests: XCTestCase {
         procs.processes = [discordMain, discordHelper]
         _ = enforcer.sweep(now: t0.addingTimeInterval(1))
         _ = enforcer.sweep(now: t0.addingTimeInterval(2))
-        XCTAssertEqual(lookups, ["/Applications/Discord.app"], "one plist read per bundle root, ever")
+        XCTAssertEqual(lookups, ["/Applications/Discord.app",
+                                 "/Applications/Discord.app/Contents/Frameworks/Discord Helper (GPU).app"],
+                       "one plist read per bundle root, ever")
+    }
+
+    func testAppMovedUnderAFolderNamedContentsIsStillBlocked() {
+        let procs = FakeProcesses()
+        let sigs = FakeSignals()
+        let table = ["/Users/me/Contents/Discord.app": "com.hnc.Discord"]
+        let enforcer = AppBlockEnforcer(processes: procs, signals: sigs,
+                                        bundleIdentifier: { table[$0] },
+                                        forceKillAfter: 3, protectedBundleIDs: [], ownPID: 1)
+        procs.processes = [RunningProcess(pid: 600, executablePath: "/Users/me/Contents/Discord.app/Contents/MacOS/Discord")]
+        enforcer.setBlockedBundleIDs(["com.hnc.Discord"], now: t0)
+        XCTAssertEqual(sigs.terminated, [600])
+    }
+
+    func testDecoyBundleClaimingAProtectedIdDoesNotShieldABlockedApp() {
+        // Protection follows the process's own bundle, not whatever folder it was dropped into.
+        let procs = FakeProcesses()
+        let sigs = FakeSignals()
+        let table = ["/Users/me/Decoy.app": "com.apple.finder",
+                     "/Users/me/Decoy.app/Contents/Steam.app": "com.valvesoftware.steam"]
+        let enforcer = AppBlockEnforcer(processes: procs, signals: sigs,
+                                        bundleIdentifier: { table[$0] },
+                                        forceKillAfter: 3, protectedBundleIDs: [], ownPID: 1)
+        procs.processes = [RunningProcess(pid: 601, executablePath:
+            "/Users/me/Decoy.app/Contents/Steam.app/Contents/MacOS/steam_osx")]
+        enforcer.setBlockedBundleIDs(["com.valvesoftware.steam"], now: t0)
+        XCTAssertEqual(sigs.terminated, [601])
+    }
+
+    func testBlockedIdOnAnEnclosingBundleStillMatches() {
+        // A blocked id is matched on ANY enclosing bundle, so nesting a bundle never hides it.
+        let procs = FakeProcesses()
+        let sigs = FakeSignals()
+        let table = ["/Users/me/Wrapper.app": "com.valvesoftware.steam",
+                     "/Users/me/Wrapper.app/Contents/Inner.app": "com.example.inner"]
+        let enforcer = AppBlockEnforcer(processes: procs, signals: sigs,
+                                        bundleIdentifier: { table[$0] },
+                                        forceKillAfter: 3, protectedBundleIDs: [], ownPID: 1)
+        procs.processes = [RunningProcess(pid: 602, executablePath:
+            "/Users/me/Wrapper.app/Contents/Inner.app/Contents/MacOS/inner")]
+        enforcer.setBlockedBundleIDs(["com.valvesoftware.steam"], now: t0)
+        XCTAssertEqual(sigs.terminated, [602])
     }
 
     // MARK: store
